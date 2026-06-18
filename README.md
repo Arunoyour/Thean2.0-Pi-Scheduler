@@ -66,6 +66,7 @@ Edit `jobs.json` to define your jobs:
 | `read_timeout` | No | `10` | Seconds to wait for response |
 | `retry_count` | No | `5` | Number of retries before logging failure |
 | `retry_delay` | No | `30` | Seconds between retries |
+| `run_at` | No | — | Exact daily time to run in `HH:MM` (24h format). Use instead of `interval_seconds` for daily jobs. e.g. `"run_at": "00:00"` fires at midnight every day |
 
 To apply config changes without reinstalling:
 

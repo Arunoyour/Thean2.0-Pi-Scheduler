@@ -9,6 +9,7 @@ import signal
 import requests
 from pathlib import Path
 from logging.handlers import RotatingFileHandler
+from datetime import datetime, timedelta
 
 # ---------------------------------------------------------------------------
 # Paths — all relative to this script's location
@@ -48,7 +49,6 @@ def setup_logger():
     file_handler.setFormatter(fmt)
     logger.addHandler(file_handler)
 
-    # Mirror to stdout so systemd journal captures it too
     stdout_handler = logging.StreamHandler(sys.stdout)
     stdout_handler.setFormatter(fmt)
     logger.addHandler(stdout_handler)
@@ -114,22 +114,39 @@ def load_config():
             log_warn(f"Duplicate job name '{name}' — skipping duplicate.")
             continue
 
-        interval = job.get("interval_seconds", 60)
-        if not isinstance(interval, (int, float)) or interval <= 0:
-            log_warn(f"Job '{name}' has invalid interval '{interval}' — skipping.")
+        has_interval = "interval_seconds" in job
+        has_run_at   = "run_at" in job
+
+        if not has_interval and not has_run_at:
+            log_warn(f"Job '{name}' has no 'interval_seconds' or 'run_at' — skipping.")
             continue
+
+        if has_interval:
+            interval = job["interval_seconds"]
+            if not isinstance(interval, (int, float)) or interval <= 0:
+                log_warn(f"Job '{name}' has invalid interval '{interval}' — skipping.")
+                continue
+
+        if has_run_at:
+            run_at = job["run_at"]
+            try:
+                datetime.strptime(run_at, "%H:%M")
+            except ValueError:
+                log_warn(f"Job '{name}' has invalid run_at '{run_at}' — expected HH:MM — skipping.")
+                continue
 
         seen_names.add(name)
         validated.append({
-            "name":            name,
-            "url":             job["url"],
-            "interval_seconds": float(interval),
-            "headers":         job.get("headers", {}),
-            "body":            job.get("body", None),
-            "connect_timeout": job.get("connect_timeout", 5),
-            "read_timeout":    job.get("read_timeout", 10),
-            "retry_count":     job.get("retry_count", RETRY_COUNT),
-            "retry_delay":     job.get("retry_delay", RETRY_DELAY),
+            "name":             name,
+            "url":              job["url"],
+            "interval_seconds": float(job["interval_seconds"]) if has_interval else None,
+            "run_at":           job.get("run_at", None),
+            "headers":          job.get("headers", {}),
+            "body":             job.get("body", None),
+            "connect_timeout":  job.get("connect_timeout", 5),
+            "read_timeout":     job.get("read_timeout", 10),
+            "retry_count":      job.get("retry_count", RETRY_COUNT),
+            "retry_delay":      job.get("retry_delay", RETRY_DELAY),
         })
 
     if not validated:
@@ -137,6 +154,18 @@ def load_config():
         sys.exit(1)
 
     return validated
+
+
+# ---------------------------------------------------------------------------
+# Time helper — seconds until next HH:MM occurrence
+# ---------------------------------------------------------------------------
+def seconds_until_next(run_at: str) -> float:
+    now = datetime.now()
+    h, m = map(int, run_at.split(":"))
+    target = now.replace(hour=h, minute=m, second=0, microsecond=0)
+    if target <= now:
+        target += timedelta(days=1)
+    return (target - now).total_seconds()
 
 
 # ---------------------------------------------------------------------------
@@ -176,10 +205,10 @@ def post_once(job):
 # Job runner (retries included)
 # ---------------------------------------------------------------------------
 def run_job(job):
-    name          = job["name"]
-    url           = job["url"]
-    max_retries   = job["retry_count"]
-    retry_delay   = job["retry_delay"]
+    name        = job["name"]
+    url         = job["url"]
+    max_retries = job["retry_count"]
+    retry_delay = job["retry_delay"]
 
     for attempt in range(1, max_retries + 1):
         success, reason, status_code, body = post_once(job)
@@ -202,9 +231,9 @@ def run_job(job):
 
 
 # ---------------------------------------------------------------------------
-# Job loop — runs in its own thread
+# Interval-based job loop
 # ---------------------------------------------------------------------------
-def job_loop(job, stop_event):
+def interval_job_loop(job, stop_event):
     interval = job["interval_seconds"]
     name     = job["name"]
     log_info(f"Job '{name}' running every {interval}s")
@@ -214,8 +243,32 @@ def job_loop(job, stop_event):
             run_job(job)
         except Exception as e:
             log_failure(name, job["url"], f"Unhandled thread exception: {e}")
-
         stop_event.wait(interval)
+
+
+# ---------------------------------------------------------------------------
+# Clock-time job loop (exact HH:MM daily)
+# ---------------------------------------------------------------------------
+def timed_job_loop(job, stop_event):
+    name   = job["name"]
+    run_at = job["run_at"]
+    log_info(f"Job '{name}' scheduled daily at {run_at}")
+
+    while not stop_event.is_set():
+        wait = seconds_until_next(run_at)
+        log_info(f"Job '{name}' next run in {int(wait)}s (at {run_at})")
+        stop_event.wait(wait)
+
+        if stop_event.is_set():
+            break
+
+        try:
+            run_job(job)
+        except Exception as e:
+            log_failure(name, job["url"], f"Unhandled thread exception: {e}")
+
+        # Small buffer to avoid double-firing within the same minute
+        stop_event.wait(61)
 
 
 # ---------------------------------------------------------------------------
@@ -254,7 +307,6 @@ def main():
     stop_event = threading.Event()
     threads    = {}
 
-    # Graceful shutdown on SIGTERM / Ctrl+C
     def shutdown(signum, frame):
         log_info("Shutdown signal received. Stopping...")
         stop_event.set()
@@ -262,17 +314,20 @@ def main():
     signal.signal(signal.SIGTERM, shutdown)
     signal.signal(signal.SIGINT,  shutdown)
 
-    # Config reload on SIGHUP (Linux only)
     if platform.system() != "Windows":
         def reload_config_signal(signum, frame):
             log_info("SIGHUP received — reloading config and restarting...")
             os.execv(sys.executable, [sys.executable] + sys.argv)
         signal.signal(signal.SIGHUP, reload_config_signal)
 
-    # Start one thread per job
     for job in jobs:
+        if job["run_at"] is not None:
+            target = timed_job_loop
+        else:
+            target = interval_job_loop
+
         t = threading.Thread(
-            target=job_loop,
+            target=target,
             args=(job, stop_event),
             name=job["name"],
             daemon=True
@@ -280,7 +335,6 @@ def main():
         t.start()
         threads[job["name"]] = t
 
-    # Start watchdog
     wd = threading.Thread(
         target=watchdog,
         args=(threads, stop_event),
