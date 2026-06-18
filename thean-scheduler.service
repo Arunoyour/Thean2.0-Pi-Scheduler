@@ -1,0 +1,17 @@
+[Unit]
+Description=Thean Scheduler
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+# Update this path to wherever you placed the Thean_scheduler folder
+ExecStart=/usr/bin/python3 /home/pi/Thean_scheduler/main.py
+WorkingDirectory=/home/pi/Thean_scheduler
+Restart=always
+RestartSec=10
+# Restart if the process uses more than 200MB RAM
+MemoryMax=200M
+
+[Install]
+WantedBy=multi-user.target

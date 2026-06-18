@@ -1,0 +1,6 @@
+# Force LF line endings on the Pi (Linux)
+*.sh        eol=lf
+*.py        eol=lf
+*.json      eol=lf
+*.service   eol=lf
+*.md        eol=lf
