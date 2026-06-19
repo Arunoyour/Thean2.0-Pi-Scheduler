@@ -64,6 +64,15 @@
       "retry_delay": 30
     },
     {
+      "name": "haircut_mark_no_shows",
+      "url": "http://68.233.107.177/api/v1/cron/jobs/haircut_mark_no_shows/run",
+      "interval_seconds": 300,
+      "connect_timeout": 5,
+      "read_timeout": 10,
+      "retry_count": 5,
+      "retry_delay": 30
+    },
+    {
       "name": "escalate_stale_disputes",
       "url": "http://68.233.107.177/api/v1/cron/jobs/escalate_stale_disputes/run",
       "interval_seconds": 14400,
