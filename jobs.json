@@ -1,6 +1,11 @@
 {
+  "sql_connection": "PLACEHOLDER_CONNECTION_STRING",
+
   "jobs": [
+
     {
+      "project": "THEAN",
+      "type": "http",
       "name": "sla_order_transitions",
       "url": "http://68.233.107.177/api/v1/cron/jobs/sla_order_transitions/run",
       "interval_seconds": 10,
@@ -10,6 +15,8 @@
       "retry_delay": 30
     },
     {
+      "project": "THEAN",
+      "type": "http",
       "name": "expire_delivery_accept_deadlines",
       "url": "http://68.233.107.177/api/v1/cron/jobs/expire_delivery_accept_deadlines/run",
       "interval_seconds": 30,
@@ -19,6 +26,8 @@
       "retry_delay": 30
     },
     {
+      "project": "THEAN",
+      "type": "http",
       "name": "remind_pharmacy_pending_pickup",
       "url": "http://68.233.107.177/api/v1/cron/jobs/remind_pharmacy_pending_pickup/run",
       "interval_seconds": 120,
@@ -28,6 +37,8 @@
       "retry_delay": 30
     },
     {
+      "project": "THEAN",
+      "type": "http",
       "name": "mark_stale_drivers_offline",
       "url": "http://68.233.107.177/api/v1/cron/jobs/mark_stale_drivers_offline/run",
       "interval_seconds": 180,
@@ -37,6 +48,8 @@
       "retry_delay": 30
     },
     {
+      "project": "THEAN",
+      "type": "http",
       "name": "retry_unassigned_delivery_orders",
       "url": "http://68.233.107.177/api/v1/cron/jobs/retry_unassigned_delivery_orders/run",
       "interval_seconds": 300,
@@ -46,24 +59,8 @@
       "retry_delay": 30
     },
     {
-      "name": "process_unmatched_gateway_events",
-      "url": "http://68.233.107.177/api/v1/cron/jobs/process_unmatched_gateway_events/run",
-      "interval_seconds": 600,
-      "connect_timeout": 5,
-      "read_timeout": 10,
-      "retry_count": 5,
-      "retry_delay": 30
-    },
-    {
-      "name": "check_cod_balance_reminders",
-      "url": "http://68.233.107.177/api/v1/cron/jobs/check_cod_balance_reminders/run",
-      "interval_seconds": 1800,
-      "connect_timeout": 5,
-      "read_timeout": 10,
-      "retry_count": 5,
-      "retry_delay": 30
-    },
-    {
+      "project": "THEAN",
+      "type": "http",
       "name": "haircut_mark_no_shows",
       "url": "http://68.233.107.177/api/v1/cron/jobs/haircut_mark_no_shows/run",
       "interval_seconds": 300,
@@ -73,6 +70,30 @@
       "retry_delay": 30
     },
     {
+      "project": "THEAN",
+      "type": "http",
+      "name": "process_unmatched_gateway_events",
+      "url": "http://68.233.107.177/api/v1/cron/jobs/process_unmatched_gateway_events/run",
+      "interval_seconds": 600,
+      "connect_timeout": 5,
+      "read_timeout": 10,
+      "retry_count": 5,
+      "retry_delay": 30
+    },
+    {
+      "project": "THEAN",
+      "type": "http",
+      "name": "check_cod_balance_reminders",
+      "url": "http://68.233.107.177/api/v1/cron/jobs/check_cod_balance_reminders/run",
+      "interval_seconds": 1800,
+      "connect_timeout": 5,
+      "read_timeout": 10,
+      "retry_count": 5,
+      "retry_delay": 30
+    },
+    {
+      "project": "THEAN",
+      "type": "http",
       "name": "escalate_stale_disputes",
       "url": "http://68.233.107.177/api/v1/cron/jobs/escalate_stale_disputes/run",
       "interval_seconds": 14400,
@@ -82,6 +103,8 @@
       "retry_delay": 30
     },
     {
+      "project": "THEAN",
+      "type": "http",
       "name": "create_daily_settlement_cycle",
       "url": "http://68.233.107.177/api/v1/cron/jobs/create_daily_settlement_cycle/run",
       "run_at": "00:00",
@@ -91,6 +114,8 @@
       "retry_delay": 30
     },
     {
+      "project": "THEAN",
+      "type": "http",
       "name": "retry_rejected_approval_requests",
       "url": "http://68.233.107.177/api/v1/cron/jobs/retry_rejected_approval_requests/run",
       "run_at": "01:00",
@@ -100,6 +125,8 @@
       "retry_delay": 30
     },
     {
+      "project": "THEAN",
+      "type": "http",
       "name": "escalate_stale_reconciliation_exceptions",
       "url": "http://68.233.107.177/api/v1/cron/jobs/escalate_stale_reconciliation_exceptions/run",
       "run_at": "02:00",
@@ -109,6 +136,8 @@
       "retry_delay": 30
     },
     {
+      "project": "THEAN",
+      "type": "http",
       "name": "cleanup_expired_otps",
       "url": "http://68.233.107.177/api/v1/cron/jobs/cleanup_expired_otps/run",
       "run_at": "03:00",
@@ -118,6 +147,8 @@
       "retry_delay": 30
     },
     {
+      "project": "THEAN",
+      "type": "http",
       "name": "prune_old_audit_logs",
       "url": "http://68.233.107.177/api/v1/cron/jobs/prune_old_audit_logs/run",
       "run_at": "04:00",
@@ -125,6 +156,78 @@
       "read_timeout": 10,
       "retry_count": 5,
       "retry_delay": 30
+    },
+
+    {
+      "project": "COCO CABS",
+      "type": "sp",
+      "name": "AssignScheduledTrips",
+      "procedure": "coco.uspDbAssignScheduledTripToDrivers",
+      "interval_seconds": 15,
+      "has_output_params": true,
+      "retry_count": 3,
+      "retry_delay": 15
+    },
+    {
+      "project": "COCO CABS",
+      "type": "sp",
+      "name": "AutoCancelNoShowTripGhost",
+      "procedure": "coco.uspDbAutoCancelNoShowTripGhost",
+      "interval_seconds": 15,
+      "has_output_params": true,
+      "retry_count": 3,
+      "retry_delay": 15
+    },
+    {
+      "project": "COCO CABS",
+      "type": "sp",
+      "name": "InsertDriverNonSettledAmountGhost",
+      "procedure": "coco.uspDbInsertDriverNonSettledAmountGhost",
+      "interval_seconds": 3600,
+      "has_output_params": true,
+      "retry_count": 3,
+      "retry_delay": 15
+    },
+    {
+      "project": "COCO CABS",
+      "type": "sp",
+      "name": "FindLateRunningPickups",
+      "procedure": "coco.uspDbFindLateRunningPickups",
+      "interval_seconds": 15,
+      "has_output_params": true,
+      "retry_count": 3,
+      "retry_delay": 15
+    },
+    {
+      "project": "COCO CABS",
+      "type": "sp",
+      "name": "ReAssignScheduledTripToDriver",
+      "procedure": "coco.uspDbReAssignScheduledTripToDriver",
+      "interval_seconds": 15,
+      "has_output_params": true,
+      "retry_count": 3,
+      "retry_delay": 15
+    },
+    {
+      "project": "COCO CABS",
+      "type": "sp",
+      "name": "TripFindDriverForTripAuto",
+      "procedure": "coco.uspDbTripFindDriverForTripAuto",
+      "interval_seconds": 15,
+      "has_output_params": true,
+      "retry_count": 3,
+      "retry_delay": 15
+    },
+    {
+      "project": "COCO CABS",
+      "type": "fcm",
+      "name": "Message_Token_And_Acknowledge",
+      "procedure": "coco.usp_GetMessageTokenAndAcknowledgeGHOST",
+      "firebase_credential": "cococabdriver-firebase-adminsdk-eeb13-9ae9615334.json",
+      "interval_seconds": 5,
+      "retry_count": 3,
+      "retry_delay": 15
     }
+
   ]
 }

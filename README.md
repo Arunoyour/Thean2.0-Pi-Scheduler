@@ -34,7 +34,14 @@ The install script will:
 
 ## Configuration
 
-Edit `jobs.json` to define your jobs:
+Edit `jobs.json` to define your jobs. The top-level `sql_connection` field is shared across all SP and FCM jobs:
+
+```json
+{
+  "sql_connection": "Server=YOUR_SERVER;Database=YOUR_DB;User=YOUR_USER;Password=YOUR_PASSWORD",
+  "jobs": [...]
+}
+```
 
 ```json
 {
@@ -67,6 +74,11 @@ Edit `jobs.json` to define your jobs:
 | `retry_count` | No | `5` | Number of retries before logging failure |
 | `retry_delay` | No | `30` | Seconds between retries |
 | `run_at` | No | — | Exact daily time to run in `HH:MM` (24h format). Use instead of `interval_seconds` for daily jobs. e.g. `"run_at": "00:00"` fires at midnight every day |
+| `project` | No | `UNKNOWN` | Label for filtering logs e.g. `THEAN` or `COCO CABS` |
+| `type` | No | `http` | Job type: `http`, `sp` (stored procedure), or `fcm` (Firebase push notification) |
+| `procedure` | For `sp`/`fcm` | — | SQL stored procedure name e.g. `coco.uspDbAssignScheduledTripToDrivers` |
+| `has_output_params` | For `sp` | `true` | Whether the SP returns `@status_cd` and `@status_desc` output params |
+| `firebase_credential` | For `fcm` | — | Path to Firebase Admin SDK JSON file, relative to `main.py` |
 
 To apply config changes without reinstalling:
 
