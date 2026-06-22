@@ -69,7 +69,7 @@ def log_failure(project, job_name, reason, status_code=None, body=None):
         lines.append(f"  STATUS  : {status_code}")
     lines.append(f"  REASON  : {reason}")
     if body:
-        lines.append(f"  BODY    : {str(body)[:500]}")
+        lines.append(f"  BODY    : {str(body)[:5000]}")
     logger.error("\n".join(lines))
 
 
