@@ -2,17 +2,17 @@ import os
 import sys
 import json
 import time
-import logging
 import threading
 import platform
 import signal
 from pathlib import Path
 from datetime import datetime, timedelta
+from collections import defaultdict
 
 import requests
 
 # ---------------------------------------------------------------------------
-# Paths — all relative to this script's location
+# Paths
 # ---------------------------------------------------------------------------
 BASE_DIR    = Path(__file__).parent.resolve()
 CONFIG_FILE = BASE_DIR / "jobs.json"
@@ -21,11 +21,39 @@ LOG_DIR     = BASE_DIR / "logs"
 # ---------------------------------------------------------------------------
 # Defaults
 # ---------------------------------------------------------------------------
-STARTUP_DELAY     = 30
-RETRY_COUNT       = 5
-RETRY_DELAY       = 30
-WATCHDOG_INTERVAL = 30
-RATE_LIMIT_WAIT   = 60
+STARTUP_DELAY      = 30
+RETRY_COUNT        = 5
+RETRY_DELAY        = 30
+WATCHDOG_INTERVAL  = 30
+RATE_LIMIT_WAIT    = 60
+SUMMARY_INTERVAL   = 30 * 60   # 30 minutes
+SUMMARY_HOLD       = 10        # seconds to show summary before clearing
+
+# ---------------------------------------------------------------------------
+# Terminal colours
+# ---------------------------------------------------------------------------
+GREEN  = "\033[92m"
+RED    = "\033[91m"
+YELLOW = "\033[93m"
+CYAN   = "\033[96m"
+BOLD   = "\033[1m"
+RESET  = "\033[0m"
+
+# ---------------------------------------------------------------------------
+# Job stats — thread-safe counters per job name
+# ---------------------------------------------------------------------------
+_stats_lock = threading.Lock()
+_stats: dict = defaultdict(lambda: {"runs": 0, "success": 0, "failure": 0})
+
+
+def record_stat(job_name: str, success: bool):
+    with _stats_lock:
+        _stats[job_name]["runs"] += 1
+        if success:
+            _stats[job_name]["success"] += 1
+        else:
+            _stats[job_name]["failure"] += 1
+
 
 # ---------------------------------------------------------------------------
 # Logging — date/hour based files
@@ -34,10 +62,10 @@ _log_lock = threading.Lock()
 
 
 def _get_log_file(log_type: str) -> Path:
-    now        = datetime.now()
-    date_str   = now.strftime("%Y-%m-%d")
-    hour_str   = now.strftime("%Y-%m-%d_%H")
-    folder     = LOG_DIR / date_str
+    now      = datetime.now()
+    date_str = now.strftime("%Y-%m-%d")
+    hour_str = now.strftime("%Y-%m-%d_%H")
+    folder   = LOG_DIR / date_str
     folder.mkdir(parents=True, exist_ok=True)
     return folder / f"{hour_str}_{log_type}.log"
 
@@ -45,13 +73,52 @@ def _get_log_file(log_type: str) -> Path:
 def _write_log(log_type: str, lines: list):
     entry = f"[{datetime.now().strftime('%Y-%m-%d %H:%M:%S')}]\n" + "\n".join(lines) + "\n\n"
     with _log_lock:
-        log_file = _get_log_file(log_type)
-        with open(log_file, "a", encoding="utf-8") as f:
+        with open(_get_log_file(log_type), "a", encoding="utf-8") as f:
             f.write(entry)
-    print(entry, flush=True)
 
 
-def log_success(project, job_name, status_code):
+def _write_summary_file(content: str):
+    now      = datetime.now()
+    date_str = now.strftime("%Y-%m-%d")
+    folder   = LOG_DIR / date_str
+    folder.mkdir(parents=True, exist_ok=True)
+    summary_file = folder / f"{date_str}_summary.log"
+    with _log_lock:
+        with open(summary_file, "a", encoding="utf-8") as f:
+            f.write(content)
+
+
+# ---------------------------------------------------------------------------
+# Terminal output
+# ---------------------------------------------------------------------------
+def print_job_line(project: str, job_name: str, status_code, success: bool, reason: str = None):
+    ts      = datetime.now().strftime("%H:%M:%S")
+    project_col = f"{project:<12}"
+    job_col     = f"{job_name:<42}"
+
+    if success:
+        result = f"{GREEN}{status_code} Success{RESET}"
+    else:
+        detail = reason or ""
+        result = f"{RED}{status_code or 'ERR'} {detail[:50]}{RESET}"
+
+    print(f"[{ts}] {CYAN}{project_col}{RESET}| {job_col}| {result}", flush=True)
+
+
+def log_info(msg: str):
+    print(f"{YELLOW}[INFO ] {msg}{RESET}", flush=True)
+
+
+def log_warn(msg: str):
+    print(f"{YELLOW}[WARN ] {msg}{RESET}", flush=True)
+
+
+# ---------------------------------------------------------------------------
+# File loggers
+# ---------------------------------------------------------------------------
+def log_success(project: str, job_name: str, status_code):
+    record_stat(job_name, True)
+    print_job_line(project, job_name, status_code, True)
     _write_log("success", [
         f"  PROJECT : {project}",
         f"  JOB     : {job_name}",
@@ -60,7 +127,9 @@ def log_success(project, job_name, status_code):
     ])
 
 
-def log_failure(project, job_name, reason, status_code=None, body=None):
+def log_failure(project: str, job_name: str, reason: str, status_code=None, body=None):
+    record_stat(job_name, False)
+    print_job_line(project, job_name, status_code, False, reason)
     lines = [
         f"  PROJECT : {project}",
         f"  JOB     : {job_name}",
@@ -73,12 +142,56 @@ def log_failure(project, job_name, reason, status_code=None, body=None):
     _write_log("error", lines)
 
 
-def log_info(msg):
-    print(f"[INFO ] {msg}", flush=True)
+# ---------------------------------------------------------------------------
+# Summary
+# ---------------------------------------------------------------------------
+def build_summary_text(ts: str, stats_snapshot: dict) -> str:
+    total_runs    = sum(v["runs"]    for v in stats_snapshot.values())
+    total_success = sum(v["success"] for v in stats_snapshot.values())
+    total_failure = sum(v["failure"] for v in stats_snapshot.values())
+
+    divider = "─" * 60
+    lines = [
+        f"\n{divider}",
+        f" Summary @ {ts}",
+        f"{divider}",
+        f" Total runs : {total_runs:<6} Success : {total_success:<6} Failed : {total_failure}",
+        f"{divider}",
+    ]
+    for job_name, v in sorted(stats_snapshot.items()):
+        lines.append(
+            f"  {job_name:<42}| runs: {v['runs']:<5} ok: {v['success']:<5} fail: {v['failure']}"
+        )
+    lines.append(divider)
+    return "\n".join(lines) + "\n"
 
 
-def log_warn(msg):
-    print(f"[WARN ] {msg}", flush=True)
+def print_summary_and_clear():
+    ts = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+
+    with _stats_lock:
+        stats_snapshot = {k: dict(v) for k, v in _stats.items()}
+
+    summary_text = build_summary_text(ts, stats_snapshot)
+
+    # Print to terminal with colours
+    print(f"\n{BOLD}{CYAN}{summary_text}{RESET}", flush=True)
+    print(f"{YELLOW}Clearing terminal in {SUMMARY_HOLD} seconds...{RESET}", flush=True)
+
+    # Write to daily summary file
+    _write_summary_file(summary_text)
+
+    time.sleep(SUMMARY_HOLD)
+    os.system("clear" if platform.system() != "Windows" else "cls")
+    log_info(f"Scheduler running — next summary in {SUMMARY_INTERVAL // 60} min")
+
+
+def summary_loop(stop_event):
+    while not stop_event.is_set():
+        stop_event.wait(SUMMARY_INTERVAL)
+        if stop_event.is_set():
+            break
+        print_summary_and_clear()
 
 
 # ---------------------------------------------------------------------------
@@ -232,25 +345,20 @@ def run_job(job):
 
 
 # ---------------------------------------------------------------------------
-# Interval-based job loop
+# Job loops
 # ---------------------------------------------------------------------------
 def interval_job_loop(job, stop_event):
     interval = job["interval_seconds"]
-    name     = job["name"]
-    project  = job["project"]
-    log_info(f"[{project}] Job '{name}' running every {interval}s")
+    log_info(f"[{job['project']}] Job '{job['name']}' running every {interval}s")
 
     while not stop_event.is_set():
         try:
             run_job(job)
         except Exception as e:
-            log_failure(job["project"], name, f"Unhandled thread exception: {e}")
+            log_failure(job["project"], job["name"], f"Unhandled thread exception: {e}")
         stop_event.wait(interval)
 
 
-# ---------------------------------------------------------------------------
-# Clock-time job loop (exact HH:MM daily)
-# ---------------------------------------------------------------------------
 def timed_job_loop(job, stop_event):
     name    = job["name"]
     project = job["project"]
@@ -329,13 +437,21 @@ def main():
         t.start()
         threads[job["name"]] = t
 
-    wd = threading.Thread(
+    # Watchdog thread
+    threading.Thread(
         target=watchdog,
         args=(threads, stop_event),
         name="watchdog",
         daemon=True
-    )
-    wd.start()
+    ).start()
+
+    # Summary thread
+    threading.Thread(
+        target=summary_loop,
+        args=(stop_event,),
+        name="summary",
+        daemon=True
+    ).start()
 
     stop_event.wait()
     log_info("Scheduler stopped.")
