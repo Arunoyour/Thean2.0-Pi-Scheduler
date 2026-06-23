@@ -1,6 +1,4 @@
 {
-  "sql_connection": "PLACEHOLDER_CONNECTION_STRING",
-
   "jobs": [
 
     {

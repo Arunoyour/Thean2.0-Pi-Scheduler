@@ -7,7 +7,6 @@ import threading
 import platform
 import signal
 from pathlib import Path
-from logging.handlers import RotatingFileHandler
 from datetime import datetime, timedelta
 
 import requests
@@ -18,7 +17,6 @@ import requests
 BASE_DIR    = Path(__file__).parent.resolve()
 CONFIG_FILE = BASE_DIR / "jobs.json"
 LOG_DIR     = BASE_DIR / "logs"
-LOG_FILE    = LOG_DIR  / "errors.log"
 
 # ---------------------------------------------------------------------------
 # Defaults
@@ -28,36 +26,38 @@ RETRY_COUNT       = 5
 RETRY_DELAY       = 30
 WATCHDOG_INTERVAL = 30
 RATE_LIMIT_WAIT   = 60
-LOG_MAX_BYTES     = 5 * 1024 * 1024
-LOG_BACKUP_COUNT  = 3
-
 
 # ---------------------------------------------------------------------------
-# Logger
+# Logging — date/hour based files
 # ---------------------------------------------------------------------------
-def setup_logger():
-    LOG_DIR.mkdir(parents=True, exist_ok=True)
-    logger = logging.getLogger("scheduler")
-    logger.setLevel(logging.ERROR)
-
-    file_handler = RotatingFileHandler(
-        LOG_FILE,
-        maxBytes=LOG_MAX_BYTES,
-        backupCount=LOG_BACKUP_COUNT,
-        encoding="utf-8"
-    )
-    fmt = logging.Formatter("[%(asctime)s]\n%(message)s\n", datefmt="%Y-%m-%d %H:%M:%S")
-    file_handler.setFormatter(fmt)
-    logger.addHandler(file_handler)
-
-    stdout_handler = logging.StreamHandler(sys.stdout)
-    stdout_handler.setFormatter(fmt)
-    logger.addHandler(stdout_handler)
-
-    return logger
+_log_lock = threading.Lock()
 
 
-logger = setup_logger()
+def _get_log_file(log_type: str) -> Path:
+    now        = datetime.now()
+    date_str   = now.strftime("%Y-%m-%d")
+    hour_str   = now.strftime("%Y-%m-%d_%H")
+    folder     = LOG_DIR / date_str
+    folder.mkdir(parents=True, exist_ok=True)
+    return folder / f"{hour_str}_{log_type}.log"
+
+
+def _write_log(log_type: str, lines: list):
+    entry = f"[{datetime.now().strftime('%Y-%m-%d %H:%M:%S')}]\n" + "\n".join(lines) + "\n\n"
+    with _log_lock:
+        log_file = _get_log_file(log_type)
+        with open(log_file, "a", encoding="utf-8") as f:
+            f.write(entry)
+    print(entry, flush=True)
+
+
+def log_success(project, job_name, status_code):
+    _write_log("success", [
+        f"  PROJECT : {project}",
+        f"  JOB     : {job_name}",
+        f"  STATUS  : {status_code}",
+        f"  RESULT  : Success",
+    ])
 
 
 def log_failure(project, job_name, reason, status_code=None, body=None):
@@ -70,7 +70,7 @@ def log_failure(project, job_name, reason, status_code=None, body=None):
     lines.append(f"  REASON  : {reason}")
     if body:
         lines.append(f"  BODY    : {str(body)[:5000]}")
-    logger.error("\n".join(lines))
+    _write_log("error", lines)
 
 
 def log_info(msg):
@@ -79,40 +79,6 @@ def log_info(msg):
 
 def log_warn(msg):
     print(f"[WARN ] {msg}", flush=True)
-
-
-# ---------------------------------------------------------------------------
-# Firebase — lazy init, one instance shared across all FCM jobs
-# ---------------------------------------------------------------------------
-_firebase_initialized = {}
-_firebase_lock = threading.Lock()
-
-
-def get_firebase_app(credential_path: str):
-    abs_path = str(BASE_DIR / credential_path)
-    with _firebase_lock:
-        if abs_path not in _firebase_initialized:
-            try:
-                import firebase_admin
-                from firebase_admin import credentials as fb_credentials
-                cred = fb_credentials.Certificate(abs_path)
-                app = firebase_admin.initialize_app(cred, name=abs_path)
-                _firebase_initialized[abs_path] = app
-            except Exception as e:
-                raise RuntimeError(f"Firebase init failed for {abs_path}: {e}")
-    return _firebase_initialized[abs_path]
-
-
-def send_fcm(credential_path: str, token: str, title: str, body: str, notification_type: str):
-    from firebase_admin import messaging
-    app = get_firebase_app(credential_path)
-    message = messaging.Message(
-        token=token,
-        notification=messaging.Notification(title=title, body=body),
-        data={"Type": notification_type},
-        android=messaging.AndroidConfig(priority="high"),
-    )
-    return messaging.send(message, app=app)
 
 
 # ---------------------------------------------------------------------------
@@ -130,9 +96,7 @@ def load_config():
         print(f"[ERROR] Malformed JSON in jobs.json: {e}")
         sys.exit(1)
 
-    sql_connection = config.get("sql_connection", "")
     raw_jobs = config.get("jobs", [])
-
     if not raw_jobs:
         print("[ERROR] No jobs found in jobs.json.")
         sys.exit(1)
@@ -149,64 +113,48 @@ def load_config():
             log_warn(f"Duplicate job name '{name}' — skipping.")
             continue
 
-        if jtype == "http":
-            if not job.get("url"):
-                log_warn(f"Job '{name}' has no URL — skipping.")
-                continue
-            has_interval = "interval_seconds" in job
-            has_run_at   = "run_at" in job
-            if not has_interval and not has_run_at:
-                log_warn(f"Job '{name}' has no interval_seconds or run_at — skipping.")
-                continue
-            if has_run_at:
-                try:
-                    datetime.strptime(job["run_at"], "%H:%M")
-                except ValueError:
-                    log_warn(f"Job '{name}' has invalid run_at '{job['run_at']}' — skipping.")
-                    continue
-            if has_interval:
-                interval = job["interval_seconds"]
-                if not isinstance(interval, (int, float)) or interval <= 0:
-                    log_warn(f"Job '{name}' has invalid interval '{interval}' — skipping.")
-                    continue
-
-        elif jtype in ("sp", "fcm"):
-            if not job.get("procedure"):
-                log_warn(f"Job '{name}' has no procedure — skipping.")
-                continue
-            interval = job.get("interval_seconds", 60)
-            if not isinstance(interval, (int, float)) or interval <= 0:
-                log_warn(f"Job '{name}' has invalid interval '{interval}' — skipping.")
-                continue
-            if jtype == "fcm" and not job.get("firebase_credential"):
-                log_warn(f"Job '{name}' has no firebase_credential — skipping.")
-                continue
-        else:
+        if jtype != "http":
             log_warn(f"Job '{name}' has unknown type '{jtype}' — skipping.")
             continue
 
+        if not job.get("url"):
+            log_warn(f"Job '{name}' has no URL — skipping.")
+            continue
+
+        has_interval = "interval_seconds" in job
+        has_run_at   = "run_at" in job
+
+        if not has_interval and not has_run_at:
+            log_warn(f"Job '{name}' has no interval_seconds or run_at — skipping.")
+            continue
+
+        if has_run_at:
+            try:
+                datetime.strptime(job["run_at"], "%H:%M")
+            except ValueError:
+                log_warn(f"Job '{name}' has invalid run_at '{job['run_at']}' — skipping.")
+                continue
+
+        if has_interval:
+            interval = job["interval_seconds"]
+            if not isinstance(interval, (int, float)) or interval <= 0:
+                log_warn(f"Job '{name}' has invalid interval '{interval}' — skipping.")
+                continue
+
         seen_names.add(name)
         validated.append({
-            "project":            project,
-            "type":               jtype,
-            "name":               name,
-            # http fields
-            "url":                job.get("url"),
-            "run_at":             job.get("run_at"),
-            "interval_seconds":   float(job.get("interval_seconds", 60)) if jtype != "http" or "interval_seconds" in job else None,
-            "headers":            job.get("headers", {}),
-            "body":               job.get("body", None),
-            "connect_timeout":    job.get("connect_timeout", 5),
-            "read_timeout":       job.get("read_timeout", 10),
-            # sp / fcm fields
-            "procedure":          job.get("procedure"),
-            "has_output_params":  job.get("has_output_params", True),
-            "firebase_credential":job.get("firebase_credential"),
-            # shared
-            "retry_count":        job.get("retry_count", RETRY_COUNT),
-            "retry_delay":        job.get("retry_delay", RETRY_DELAY),
-            # runtime
-            "_sql_connection":    sql_connection,
+            "project":          project,
+            "type":             jtype,
+            "name":             name,
+            "url":              job["url"],
+            "run_at":           job.get("run_at"),
+            "interval_seconds": float(job["interval_seconds"]) if has_interval else None,
+            "headers":          job.get("headers", {}),
+            "body":             job.get("body", None),
+            "connect_timeout":  job.get("connect_timeout", 5),
+            "read_timeout":     job.get("read_timeout", 10),
+            "retry_count":      job.get("retry_count", RETRY_COUNT),
+            "retry_delay":      job.get("retry_delay", RETRY_DELAY),
         })
 
     if not validated:
@@ -256,7 +204,7 @@ def http_post_once(job):
         return False, f"Unexpected error: {e}", None, None
 
 
-def run_http_job(job):
+def run_job(job):
     name        = job["name"]
     project     = job["project"]
     max_retries = job["retry_count"]
@@ -264,137 +212,23 @@ def run_http_job(job):
 
     for attempt in range(1, max_retries + 1):
         success, reason, status_code, body = http_post_once(job)
+
         if success:
+            log_success(project, name, status_code)
             return
+
         is_last = attempt == max_retries
+
         if status_code == 429:
             log_warn(f"[{project}][{name}] Rate limited. Waiting {RATE_LIMIT_WAIT}s (attempt {attempt}/{max_retries})")
             time.sleep(RATE_LIMIT_WAIT)
             continue
+
         if not is_last:
             log_warn(f"[{project}][{name}] Attempt {attempt}/{max_retries} failed: {reason}. Retrying in {retry_delay}s.")
             time.sleep(retry_delay)
         else:
             log_failure(project, name, reason, status_code, body)
-
-
-# ---------------------------------------------------------------------------
-# SP execution
-# ---------------------------------------------------------------------------
-def run_sp_job(job):
-    import pymssql
-    name             = job["name"]
-    project          = job["project"]
-    procedure        = job["procedure"]
-    has_output       = job["has_output_params"]
-    conn_str         = job["_sql_connection"]
-    max_retries      = job["retry_count"]
-    retry_delay      = job["retry_delay"]
-
-    for attempt in range(1, max_retries + 1):
-        try:
-            conn   = pymssql.connect(conn_str)
-            cursor = conn.cursor()
-
-            if has_output:
-                cursor.callproc(procedure)
-                row = cursor.fetchone()
-                conn.close()
-
-                if row is None:
-                    return  # no output — assume success
-
-                status_cd   = bool(row[0]) if row[0] is not None else True
-                status_desc = str(row[1]) if len(row) > 1 and row[1] is not None else ""
-
-                if status_cd:
-                    return  # success
-                # SP returned failure
-                if attempt < max_retries:
-                    log_warn(f"[{project}][{name}] Attempt {attempt}/{max_retries} SP failure: {status_desc}. Retrying in {retry_delay}s.")
-                    time.sleep(retry_delay)
-                else:
-                    log_failure(project, name, f"SP returned failure: {status_desc}")
-            else:
-                cursor.callproc(procedure)
-                conn.commit()
-                conn.close()
-                return  # no output params — assume success if no exception
-
-        except Exception as e:
-            try:
-                conn.close()
-            except Exception:
-                pass
-            if attempt < max_retries:
-                log_warn(f"[{project}][{name}] Attempt {attempt}/{max_retries} exception: {e}. Retrying in {retry_delay}s.")
-                time.sleep(retry_delay)
-            else:
-                log_failure(project, name, f"Exception after {max_retries} retries: {e}")
-
-
-# ---------------------------------------------------------------------------
-# FCM execution
-# ---------------------------------------------------------------------------
-def run_fcm_job(job):
-    import pymssql
-    name        = job["name"]
-    project     = job["project"]
-    procedure   = job["procedure"]
-    credential  = job["firebase_credential"]
-    conn_str    = job["_sql_connection"]
-    max_retries = job["retry_count"]
-    retry_delay = job["retry_delay"]
-
-    for attempt in range(1, max_retries + 1):
-        try:
-            conn   = pymssql.connect(conn_str)
-            cursor = conn.cursor(as_dict=True)
-            cursor.callproc(procedure)
-            rows = cursor.fetchall()
-            conn.close()
-
-            for row in rows:
-                token    = row.get("Token", "") or ""
-                title    = row.get("MessageType", "") or ""
-                message  = row.get("Message", "") or ""
-                msg_type = ""
-
-                if not token:
-                    log_failure(project, name, "FCM skipped — empty token", body=str(row))
-                    continue
-
-                try:
-                    send_fcm(credential, token, title, message, msg_type)
-                    log_info(f"[{project}][{name}] FCM sent | {token[:20]}... | {title}")
-                except Exception as ex:
-                    log_failure(project, name, f"FCM send failed for token {token[:20]}...: {ex}")
-
-            return  # done regardless of individual FCM failures
-
-        except Exception as e:
-            try:
-                conn.close()
-            except Exception:
-                pass
-            if attempt < max_retries:
-                log_warn(f"[{project}][{name}] Attempt {attempt}/{max_retries} DB error: {e}. Retrying in {retry_delay}s.")
-                time.sleep(retry_delay)
-            else:
-                log_failure(project, name, f"DB query failed after {max_retries} retries: {e}")
-
-
-# ---------------------------------------------------------------------------
-# Job dispatcher
-# ---------------------------------------------------------------------------
-def run_job(job):
-    jtype = job["type"]
-    if jtype == "http":
-        run_http_job(job)
-    elif jtype == "sp":
-        run_sp_job(job)
-    elif jtype == "fcm":
-        run_fcm_job(job)
 
 
 # ---------------------------------------------------------------------------
@@ -448,7 +282,7 @@ def watchdog(threads, stop_event):
             if not thread.is_alive():
                 msg = f"Thread for job '{name}' died. Restarting app."
                 log_warn(msg)
-                logger.error(f"  JOB    : {name}\n  REASON : {msg}")
+                log_failure("SCHEDULER", name, msg)
                 time.sleep(2)
                 os.execv(sys.executable, [sys.executable] + sys.argv)
 
@@ -485,11 +319,7 @@ def main():
         signal.signal(signal.SIGHUP, reload_config_signal)
 
     for job in jobs:
-        if job["type"] == "http" and job.get("run_at"):
-            target = timed_job_loop
-        else:
-            target = interval_job_loop
-
+        target = timed_job_loop if job.get("run_at") else interval_job_loop
         t = threading.Thread(
             target=target,
             args=(job, stop_event),
