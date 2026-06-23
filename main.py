@@ -2,65 +2,134 @@ import os
 import sys
 import json
 import time
-import logging
 import threading
 import platform
 import signal
 from pathlib import Path
-from logging.handlers import RotatingFileHandler
 from datetime import datetime, timedelta
+from collections import defaultdict
 
 import requests
 
 # ---------------------------------------------------------------------------
-# Paths — all relative to this script's location
+# Paths
 # ---------------------------------------------------------------------------
 BASE_DIR    = Path(__file__).parent.resolve()
 CONFIG_FILE = BASE_DIR / "jobs.json"
 LOG_DIR     = BASE_DIR / "logs"
-LOG_FILE    = LOG_DIR  / "errors.log"
 
 # ---------------------------------------------------------------------------
 # Defaults
 # ---------------------------------------------------------------------------
-STARTUP_DELAY     = 30
-RETRY_COUNT       = 5
-RETRY_DELAY       = 30
-WATCHDOG_INTERVAL = 30
-RATE_LIMIT_WAIT   = 60
-LOG_MAX_BYTES     = 5 * 1024 * 1024
-LOG_BACKUP_COUNT  = 3
+STARTUP_DELAY      = 30
+RETRY_COUNT        = 5
+RETRY_DELAY        = 30
+WATCHDOG_INTERVAL  = 30
+RATE_LIMIT_WAIT    = 60
+SUMMARY_INTERVAL   = 30 * 60   # 30 minutes
+SUMMARY_HOLD       = 10        # seconds to show summary before clearing
+
+# ---------------------------------------------------------------------------
+# Terminal colours
+# ---------------------------------------------------------------------------
+GREEN  = "\033[92m"
+RED    = "\033[91m"
+YELLOW = "\033[93m"
+CYAN   = "\033[96m"
+BOLD   = "\033[1m"
+RESET  = "\033[0m"
+
+# ---------------------------------------------------------------------------
+# Job stats — thread-safe counters per job name
+# ---------------------------------------------------------------------------
+_stats_lock = threading.Lock()
+_stats: dict = defaultdict(lambda: {"runs": 0, "success": 0, "failure": 0})
+
+
+def record_stat(job_name: str, success: bool):
+    with _stats_lock:
+        _stats[job_name]["runs"] += 1
+        if success:
+            _stats[job_name]["success"] += 1
+        else:
+            _stats[job_name]["failure"] += 1
 
 
 # ---------------------------------------------------------------------------
-# Logger
+# Logging — date/hour based files
 # ---------------------------------------------------------------------------
-def setup_logger():
-    LOG_DIR.mkdir(parents=True, exist_ok=True)
-    logger = logging.getLogger("scheduler")
-    logger.setLevel(logging.ERROR)
-
-    file_handler = RotatingFileHandler(
-        LOG_FILE,
-        maxBytes=LOG_MAX_BYTES,
-        backupCount=LOG_BACKUP_COUNT,
-        encoding="utf-8"
-    )
-    fmt = logging.Formatter("[%(asctime)s]\n%(message)s\n", datefmt="%Y-%m-%d %H:%M:%S")
-    file_handler.setFormatter(fmt)
-    logger.addHandler(file_handler)
-
-    stdout_handler = logging.StreamHandler(sys.stdout)
-    stdout_handler.setFormatter(fmt)
-    logger.addHandler(stdout_handler)
-
-    return logger
+_log_lock = threading.Lock()
 
 
-logger = setup_logger()
+def _get_log_file(log_type: str) -> Path:
+    now      = datetime.now()
+    date_str = now.strftime("%Y-%m-%d")
+    hour_str = now.strftime("%Y-%m-%d_%H")
+    folder   = LOG_DIR / date_str
+    folder.mkdir(parents=True, exist_ok=True)
+    return folder / f"{hour_str}_{log_type}.log"
 
 
-def log_failure(project, job_name, reason, status_code=None, body=None):
+def _write_log(log_type: str, lines: list):
+    entry = f"[{datetime.now().strftime('%Y-%m-%d %H:%M:%S')}]\n" + "\n".join(lines) + "\n\n"
+    with _log_lock:
+        with open(_get_log_file(log_type), "a", encoding="utf-8") as f:
+            f.write(entry)
+
+
+def _write_summary_file(content: str):
+    now      = datetime.now()
+    date_str = now.strftime("%Y-%m-%d")
+    folder   = LOG_DIR / date_str
+    folder.mkdir(parents=True, exist_ok=True)
+    summary_file = folder / f"{date_str}_summary.log"
+    with _log_lock:
+        with open(summary_file, "a", encoding="utf-8") as f:
+            f.write(content)
+
+
+# ---------------------------------------------------------------------------
+# Terminal output
+# ---------------------------------------------------------------------------
+def print_job_line(project: str, job_name: str, status_code, success: bool, reason: str = None):
+    ts      = datetime.now().strftime("%H:%M:%S")
+    project_col = f"{project:<12}"
+    job_col     = f"{job_name:<42}"
+
+    if success:
+        result = f"{GREEN}{status_code} Success{RESET}"
+    else:
+        detail = reason or ""
+        result = f"{RED}{status_code or 'ERR'} {detail[:50]}{RESET}"
+
+    print(f"[{ts}] {CYAN}{project_col}{RESET}| {job_col}| {result}", flush=True)
+
+
+def log_info(msg: str):
+    print(f"{YELLOW}[INFO ] {msg}{RESET}", flush=True)
+
+
+def log_warn(msg: str):
+    print(f"{YELLOW}[WARN ] {msg}{RESET}", flush=True)
+
+
+# ---------------------------------------------------------------------------
+# File loggers
+# ---------------------------------------------------------------------------
+def log_success(project: str, job_name: str, status_code):
+    record_stat(job_name, True)
+    print_job_line(project, job_name, status_code, True)
+    _write_log("success", [
+        f"  PROJECT : {project}",
+        f"  JOB     : {job_name}",
+        f"  STATUS  : {status_code}",
+        f"  RESULT  : Success",
+    ])
+
+
+def log_failure(project: str, job_name: str, reason: str, status_code=None, body=None):
+    record_stat(job_name, False)
+    print_job_line(project, job_name, status_code, False, reason)
     lines = [
         f"  PROJECT : {project}",
         f"  JOB     : {job_name}",
@@ -70,49 +139,59 @@ def log_failure(project, job_name, reason, status_code=None, body=None):
     lines.append(f"  REASON  : {reason}")
     if body:
         lines.append(f"  BODY    : {str(body)[:5000]}")
-    logger.error("\n".join(lines))
-
-
-def log_info(msg):
-    print(f"[INFO ] {msg}", flush=True)
-
-
-def log_warn(msg):
-    print(f"[WARN ] {msg}", flush=True)
+    _write_log("error", lines)
 
 
 # ---------------------------------------------------------------------------
-# Firebase — lazy init, one instance shared across all FCM jobs
+# Summary
 # ---------------------------------------------------------------------------
-_firebase_initialized = {}
-_firebase_lock = threading.Lock()
+def build_summary_text(ts: str, stats_snapshot: dict) -> str:
+    total_runs    = sum(v["runs"]    for v in stats_snapshot.values())
+    total_success = sum(v["success"] for v in stats_snapshot.values())
+    total_failure = sum(v["failure"] for v in stats_snapshot.values())
+
+    divider = "─" * 60
+    lines = [
+        f"\n{divider}",
+        f" Summary @ {ts}",
+        f"{divider}",
+        f" Total runs : {total_runs:<6} Success : {total_success:<6} Failed : {total_failure}",
+        f"{divider}",
+    ]
+    for job_name, v in sorted(stats_snapshot.items()):
+        lines.append(
+            f"  {job_name:<42}| runs: {v['runs']:<5} ok: {v['success']:<5} fail: {v['failure']}"
+        )
+    lines.append(divider)
+    return "\n".join(lines) + "\n"
 
 
-def get_firebase_app(credential_path: str):
-    abs_path = str(BASE_DIR / credential_path)
-    with _firebase_lock:
-        if abs_path not in _firebase_initialized:
-            try:
-                import firebase_admin
-                from firebase_admin import credentials as fb_credentials
-                cred = fb_credentials.Certificate(abs_path)
-                app = firebase_admin.initialize_app(cred, name=abs_path)
-                _firebase_initialized[abs_path] = app
-            except Exception as e:
-                raise RuntimeError(f"Firebase init failed for {abs_path}: {e}")
-    return _firebase_initialized[abs_path]
+def print_summary_and_clear():
+    ts = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+
+    with _stats_lock:
+        stats_snapshot = {k: dict(v) for k, v in _stats.items()}
+
+    summary_text = build_summary_text(ts, stats_snapshot)
+
+    # Print to terminal with colours
+    print(f"\n{BOLD}{CYAN}{summary_text}{RESET}", flush=True)
+    print(f"{YELLOW}Clearing terminal in {SUMMARY_HOLD} seconds...{RESET}", flush=True)
+
+    # Write to daily summary file
+    _write_summary_file(summary_text)
+
+    time.sleep(SUMMARY_HOLD)
+    os.system("clear" if platform.system() != "Windows" else "cls")
+    log_info(f"Scheduler running — next summary in {SUMMARY_INTERVAL // 60} min")
 
 
-def send_fcm(credential_path: str, token: str, title: str, body: str, notification_type: str):
-    from firebase_admin import messaging
-    app = get_firebase_app(credential_path)
-    message = messaging.Message(
-        token=token,
-        notification=messaging.Notification(title=title, body=body),
-        data={"Type": notification_type},
-        android=messaging.AndroidConfig(priority="high"),
-    )
-    return messaging.send(message, app=app)
+def summary_loop(stop_event):
+    while not stop_event.is_set():
+        stop_event.wait(SUMMARY_INTERVAL)
+        if stop_event.is_set():
+            break
+        print_summary_and_clear()
 
 
 # ---------------------------------------------------------------------------
@@ -130,9 +209,7 @@ def load_config():
         print(f"[ERROR] Malformed JSON in jobs.json: {e}")
         sys.exit(1)
 
-    sql_connection = config.get("sql_connection", "")
     raw_jobs = config.get("jobs", [])
-
     if not raw_jobs:
         print("[ERROR] No jobs found in jobs.json.")
         sys.exit(1)
@@ -149,64 +226,48 @@ def load_config():
             log_warn(f"Duplicate job name '{name}' — skipping.")
             continue
 
-        if jtype == "http":
-            if not job.get("url"):
-                log_warn(f"Job '{name}' has no URL — skipping.")
-                continue
-            has_interval = "interval_seconds" in job
-            has_run_at   = "run_at" in job
-            if not has_interval and not has_run_at:
-                log_warn(f"Job '{name}' has no interval_seconds or run_at — skipping.")
-                continue
-            if has_run_at:
-                try:
-                    datetime.strptime(job["run_at"], "%H:%M")
-                except ValueError:
-                    log_warn(f"Job '{name}' has invalid run_at '{job['run_at']}' — skipping.")
-                    continue
-            if has_interval:
-                interval = job["interval_seconds"]
-                if not isinstance(interval, (int, float)) or interval <= 0:
-                    log_warn(f"Job '{name}' has invalid interval '{interval}' — skipping.")
-                    continue
-
-        elif jtype in ("sp", "fcm"):
-            if not job.get("procedure"):
-                log_warn(f"Job '{name}' has no procedure — skipping.")
-                continue
-            interval = job.get("interval_seconds", 60)
-            if not isinstance(interval, (int, float)) or interval <= 0:
-                log_warn(f"Job '{name}' has invalid interval '{interval}' — skipping.")
-                continue
-            if jtype == "fcm" and not job.get("firebase_credential"):
-                log_warn(f"Job '{name}' has no firebase_credential — skipping.")
-                continue
-        else:
+        if jtype != "http":
             log_warn(f"Job '{name}' has unknown type '{jtype}' — skipping.")
             continue
 
+        if not job.get("url"):
+            log_warn(f"Job '{name}' has no URL — skipping.")
+            continue
+
+        has_interval = "interval_seconds" in job
+        has_run_at   = "run_at" in job
+
+        if not has_interval and not has_run_at:
+            log_warn(f"Job '{name}' has no interval_seconds or run_at — skipping.")
+            continue
+
+        if has_run_at:
+            try:
+                datetime.strptime(job["run_at"], "%H:%M")
+            except ValueError:
+                log_warn(f"Job '{name}' has invalid run_at '{job['run_at']}' — skipping.")
+                continue
+
+        if has_interval:
+            interval = job["interval_seconds"]
+            if not isinstance(interval, (int, float)) or interval <= 0:
+                log_warn(f"Job '{name}' has invalid interval '{interval}' — skipping.")
+                continue
+
         seen_names.add(name)
         validated.append({
-            "project":            project,
-            "type":               jtype,
-            "name":               name,
-            # http fields
-            "url":                job.get("url"),
-            "run_at":             job.get("run_at"),
-            "interval_seconds":   float(job.get("interval_seconds", 60)) if jtype != "http" or "interval_seconds" in job else None,
-            "headers":            job.get("headers", {}),
-            "body":               job.get("body", None),
-            "connect_timeout":    job.get("connect_timeout", 5),
-            "read_timeout":       job.get("read_timeout", 10),
-            # sp / fcm fields
-            "procedure":          job.get("procedure"),
-            "has_output_params":  job.get("has_output_params", True),
-            "firebase_credential":job.get("firebase_credential"),
-            # shared
-            "retry_count":        job.get("retry_count", RETRY_COUNT),
-            "retry_delay":        job.get("retry_delay", RETRY_DELAY),
-            # runtime
-            "_sql_connection":    sql_connection,
+            "project":          project,
+            "type":             jtype,
+            "name":             name,
+            "url":              job["url"],
+            "run_at":           job.get("run_at"),
+            "interval_seconds": float(job["interval_seconds"]) if has_interval else None,
+            "headers":          job.get("headers", {}),
+            "body":             job.get("body", None),
+            "connect_timeout":  job.get("connect_timeout", 5),
+            "read_timeout":     job.get("read_timeout", 10),
+            "retry_count":      job.get("retry_count", RETRY_COUNT),
+            "retry_delay":      job.get("retry_delay", RETRY_DELAY),
         })
 
     if not validated:
@@ -256,7 +317,7 @@ def http_post_once(job):
         return False, f"Unexpected error: {e}", None, None
 
 
-def run_http_job(job):
+def run_job(job):
     name        = job["name"]
     project     = job["project"]
     max_retries = job["retry_count"]
@@ -264,13 +325,18 @@ def run_http_job(job):
 
     for attempt in range(1, max_retries + 1):
         success, reason, status_code, body = http_post_once(job)
+
         if success:
+            log_success(project, name, status_code)
             return
+
         is_last = attempt == max_retries
+
         if status_code == 429:
             log_warn(f"[{project}][{name}] Rate limited. Waiting {RATE_LIMIT_WAIT}s (attempt {attempt}/{max_retries})")
             time.sleep(RATE_LIMIT_WAIT)
             continue
+
         if not is_last:
             log_warn(f"[{project}][{name}] Attempt {attempt}/{max_retries} failed: {reason}. Retrying in {retry_delay}s.")
             time.sleep(retry_delay)
@@ -279,144 +345,20 @@ def run_http_job(job):
 
 
 # ---------------------------------------------------------------------------
-# SP execution
-# ---------------------------------------------------------------------------
-def run_sp_job(job):
-    import pymssql
-    name             = job["name"]
-    project          = job["project"]
-    procedure        = job["procedure"]
-    has_output       = job["has_output_params"]
-    conn_str         = job["_sql_connection"]
-    max_retries      = job["retry_count"]
-    retry_delay      = job["retry_delay"]
-
-    for attempt in range(1, max_retries + 1):
-        try:
-            conn   = pymssql.connect(conn_str)
-            cursor = conn.cursor()
-
-            if has_output:
-                cursor.callproc(procedure)
-                row = cursor.fetchone()
-                conn.close()
-
-                if row is None:
-                    return  # no output — assume success
-
-                status_cd   = bool(row[0]) if row[0] is not None else True
-                status_desc = str(row[1]) if len(row) > 1 and row[1] is not None else ""
-
-                if status_cd:
-                    return  # success
-                # SP returned failure
-                if attempt < max_retries:
-                    log_warn(f"[{project}][{name}] Attempt {attempt}/{max_retries} SP failure: {status_desc}. Retrying in {retry_delay}s.")
-                    time.sleep(retry_delay)
-                else:
-                    log_failure(project, name, f"SP returned failure: {status_desc}")
-            else:
-                cursor.callproc(procedure)
-                conn.commit()
-                conn.close()
-                return  # no output params — assume success if no exception
-
-        except Exception as e:
-            try:
-                conn.close()
-            except Exception:
-                pass
-            if attempt < max_retries:
-                log_warn(f"[{project}][{name}] Attempt {attempt}/{max_retries} exception: {e}. Retrying in {retry_delay}s.")
-                time.sleep(retry_delay)
-            else:
-                log_failure(project, name, f"Exception after {max_retries} retries: {e}")
-
-
-# ---------------------------------------------------------------------------
-# FCM execution
-# ---------------------------------------------------------------------------
-def run_fcm_job(job):
-    import pymssql
-    name        = job["name"]
-    project     = job["project"]
-    procedure   = job["procedure"]
-    credential  = job["firebase_credential"]
-    conn_str    = job["_sql_connection"]
-    max_retries = job["retry_count"]
-    retry_delay = job["retry_delay"]
-
-    for attempt in range(1, max_retries + 1):
-        try:
-            conn   = pymssql.connect(conn_str)
-            cursor = conn.cursor(as_dict=True)
-            cursor.callproc(procedure)
-            rows = cursor.fetchall()
-            conn.close()
-
-            for row in rows:
-                token    = row.get("Token", "") or ""
-                title    = row.get("MessageType", "") or ""
-                message  = row.get("Message", "") or ""
-                msg_type = ""
-
-                if not token:
-                    log_failure(project, name, "FCM skipped — empty token", body=str(row))
-                    continue
-
-                try:
-                    send_fcm(credential, token, title, message, msg_type)
-                    log_info(f"[{project}][{name}] FCM sent | {token[:20]}... | {title}")
-                except Exception as ex:
-                    log_failure(project, name, f"FCM send failed for token {token[:20]}...: {ex}")
-
-            return  # done regardless of individual FCM failures
-
-        except Exception as e:
-            try:
-                conn.close()
-            except Exception:
-                pass
-            if attempt < max_retries:
-                log_warn(f"[{project}][{name}] Attempt {attempt}/{max_retries} DB error: {e}. Retrying in {retry_delay}s.")
-                time.sleep(retry_delay)
-            else:
-                log_failure(project, name, f"DB query failed after {max_retries} retries: {e}")
-
-
-# ---------------------------------------------------------------------------
-# Job dispatcher
-# ---------------------------------------------------------------------------
-def run_job(job):
-    jtype = job["type"]
-    if jtype == "http":
-        run_http_job(job)
-    elif jtype == "sp":
-        run_sp_job(job)
-    elif jtype == "fcm":
-        run_fcm_job(job)
-
-
-# ---------------------------------------------------------------------------
-# Interval-based job loop
+# Job loops
 # ---------------------------------------------------------------------------
 def interval_job_loop(job, stop_event):
     interval = job["interval_seconds"]
-    name     = job["name"]
-    project  = job["project"]
-    log_info(f"[{project}] Job '{name}' running every {interval}s")
+    log_info(f"[{job['project']}] Job '{job['name']}' running every {interval}s")
 
     while not stop_event.is_set():
         try:
             run_job(job)
         except Exception as e:
-            log_failure(job["project"], name, f"Unhandled thread exception: {e}")
+            log_failure(job["project"], job["name"], f"Unhandled thread exception: {e}")
         stop_event.wait(interval)
 
 
-# ---------------------------------------------------------------------------
-# Clock-time job loop (exact HH:MM daily)
-# ---------------------------------------------------------------------------
 def timed_job_loop(job, stop_event):
     name    = job["name"]
     project = job["project"]
@@ -448,7 +390,7 @@ def watchdog(threads, stop_event):
             if not thread.is_alive():
                 msg = f"Thread for job '{name}' died. Restarting app."
                 log_warn(msg)
-                logger.error(f"  JOB    : {name}\n  REASON : {msg}")
+                log_failure("SCHEDULER", name, msg)
                 time.sleep(2)
                 os.execv(sys.executable, [sys.executable] + sys.argv)
 
@@ -485,11 +427,7 @@ def main():
         signal.signal(signal.SIGHUP, reload_config_signal)
 
     for job in jobs:
-        if job["type"] == "http" and job.get("run_at"):
-            target = timed_job_loop
-        else:
-            target = interval_job_loop
-
+        target = timed_job_loop if job.get("run_at") else interval_job_loop
         t = threading.Thread(
             target=target,
             args=(job, stop_event),
@@ -499,13 +437,21 @@ def main():
         t.start()
         threads[job["name"]] = t
 
-    wd = threading.Thread(
+    # Watchdog thread
+    threading.Thread(
         target=watchdog,
         args=(threads, stop_event),
         name="watchdog",
         daemon=True
-    )
-    wd.start()
+    ).start()
+
+    # Summary thread
+    threading.Thread(
+        target=summary_loop,
+        args=(stop_event,),
+        name="summary",
+        daemon=True
+    ).start()
 
     stop_event.wait()
     log_info("Scheduler stopped.")
