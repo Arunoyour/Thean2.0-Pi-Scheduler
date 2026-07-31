@@ -232,6 +232,28 @@
       "read_timeout": 10,
       "retry_count": 3,
       "retry_delay": 15
+    },
+    {
+      "project": "COCO CABS",
+      "type": "http",
+      "name": "notification_queue_sms_process",
+      "url": "https://cococabs-c5hme4bfb3c4hggz.canadacentral-01.azurewebsites.net/v1/api/notification-queue/sms/process",
+      "interval_seconds": 4,
+      "connect_timeout": 5,
+      "read_timeout": 10,
+      "retry_count": 3,
+      "retry_delay": 15
+    },
+    {
+      "project": "COCO CABS",
+      "type": "http",
+      "name": "notification_queue_email_process",
+      "url": "https://cococabs-c5hme4bfb3c4hggz.canadacentral-01.azurewebsites.net/v1/api/notification-queue/email/process",
+      "interval_seconds": 5,
+      "connect_timeout": 5,
+      "read_timeout": 10,
+      "retry_count": 3,
+      "retry_delay": 15
     }
 
   ]
