@@ -1,0 +1,15 @@
+[Unit]
+Description=Thean Scheduler Watchdog
+After=network-online.target thean-scheduler.service
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=root
+ExecStart=/bin/bash /home/REPLACE_USER/Desktop/Thean_scheduler/watchdog.sh
+WorkingDirectory=/home/REPLACE_USER/Desktop/Thean_scheduler
+Restart=always
+RestartSec=10
+
+[Install]
+WantedBy=multi-user.target
