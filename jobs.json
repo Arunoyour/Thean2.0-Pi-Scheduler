@@ -254,6 +254,17 @@
       "read_timeout": 10,
       "retry_count": 3,
       "retry_delay": 15
+    },
+    {
+      "project": "COCO CABS",
+      "type": "http",
+      "name": "AutoCancelAfterWaitingTime",
+      "url": "https://cococabs-c5hme4bfb3c4hggz.canadacentral-01.azurewebsites.net/api/Sch/ACAWT",
+      "interval_seconds": 300,
+      "connect_timeout": 5,
+      "read_timeout": 10,
+      "retry_count": 3,
+      "retry_delay": 15
     }
 
   ]
