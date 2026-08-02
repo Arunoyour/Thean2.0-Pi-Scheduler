@@ -160,17 +160,48 @@ EOF
 ok "Service file written to $SERVICE_FILE"
 
 # ---------------------------------------------------------------------------
-# Enable and start service
+# Write watchdog service file
 # ---------------------------------------------------------------------------
-info "Enabling service..."
+WATCHDOG_NAME="thean-watchdog"
+WATCHDOG_FILE="/etc/systemd/system/${WATCHDOG_NAME}.service"
+
+info "Writing watchdog service file..."
+chmod +x "$INSTALL_DIR/watchdog.sh"
+
+sudo bash -c "cat > $WATCHDOG_FILE" <<EOF
+[Unit]
+Description=Thean Scheduler Watchdog
+After=network-online.target thean-scheduler.service
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=root
+ExecStart=/bin/bash $INSTALL_DIR/watchdog.sh
+WorkingDirectory=$INSTALL_DIR
+Restart=always
+RestartSec=10
+
+[Install]
+WantedBy=multi-user.target
+EOF
+
+ok "Watchdog service file written to $WATCHDOG_FILE"
+
+# ---------------------------------------------------------------------------
+# Enable and start services
+# ---------------------------------------------------------------------------
+info "Enabling services..."
 sudo systemctl daemon-reload
 sudo systemctl enable "$SERVICE_NAME"
+sudo systemctl enable "$WATCHDOG_NAME"
 
-info "Starting service..."
+info "Starting services..."
 sudo systemctl start "$SERVICE_NAME"
+sudo systemctl start "$WATCHDOG_NAME"
 
 # ---------------------------------------------------------------------------
-# Wait a moment for service to initialise
+# Wait a moment for services to initialise
 # ---------------------------------------------------------------------------
 sleep 3
 
@@ -182,6 +213,8 @@ echo -e "${CYAN}================================================${NC}"
 echo -e "${CYAN}              Service Status                    ${NC}"
 echo -e "${CYAN}================================================${NC}"
 sudo systemctl status "$SERVICE_NAME" --no-pager
+echo ""
+sudo systemctl status "$WATCHDOG_NAME" --no-pager
 echo ""
 
 # ---------------------------------------------------------------------------
@@ -204,9 +237,10 @@ echo -e "${CYAN}================================================${NC}"
 echo -e "${GREEN}  Install complete!${NC}"
 echo ""
 echo -e "  Useful commands:"
-echo -e "  ${CYAN}sudo systemctl status $SERVICE_NAME${NC}     — check status"
-echo -e "  ${CYAN}sudo systemctl restart $SERVICE_NAME${NC}    — restart"
-echo -e "  ${CYAN}sudo systemctl stop $SERVICE_NAME${NC}       — stop"
+echo -e "  ${CYAN}sudo systemctl status $SERVICE_NAME${NC}      — scheduler status"
+echo -e "  ${CYAN}sudo systemctl status $WATCHDOG_NAME${NC}      — watchdog status"
+echo -e "  ${CYAN}sudo systemctl restart $SERVICE_NAME${NC}     — restart scheduler"
+echo -e "  ${CYAN}sudo systemctl stop $WATCHDOG_NAME${NC}        — stop watchdog"
 echo -e "  ${CYAN}tail -f $INSTALL_DIR/logs/errors.log${NC}"
 echo -e "                                              — watch live logs"
 echo -e "${CYAN}================================================${NC}"
