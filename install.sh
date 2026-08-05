@@ -118,14 +118,14 @@ else
 fi
 
 # Try normal install first, then fall back to --break-system-packages
-if ! $PIP_BIN install requests pymssql firebase-admin --quiet 2>/dev/null; then
+if ! $PIP_BIN install requests --quiet 2>/dev/null; then
     warn "Standard pip install failed. Trying --break-system-packages (Bookworm)..."
-    if ! $PIP_BIN install requests pymssql firebase-admin --break-system-packages --quiet 2>/dev/null; then
-        error "Failed to install dependencies. Please run: pip3 install requests pymssql firebase-admin"
+    if ! $PIP_BIN install requests --break-system-packages --quiet 2>/dev/null; then
+        error "Failed to install dependencies. Please run: pip3 install requests"
     fi
 fi
 
-ok "'requests', 'pymssql', 'firebase-admin' installed."
+ok "'requests' installed."
 
 # ---------------------------------------------------------------------------
 # Create logs folder
