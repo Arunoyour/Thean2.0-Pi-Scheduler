@@ -1,6 +1,8 @@
 import os
 import sys
 import json
+import re
+import shutil
 import time
 import threading
 import platform
@@ -15,8 +17,10 @@ import requests
 # Paths
 # ---------------------------------------------------------------------------
 BASE_DIR    = Path(__file__).parent.resolve()
-CONFIG_FILE = BASE_DIR / "jobs.json"
-LOG_DIR     = BASE_DIR / "logs"
+CONFIG_FILE = Path(os.environ.get("CONFIG_FILE", BASE_DIR / "jobs.json"))
+LOG_DIR     = Path(os.environ.get("LOG_DIR", BASE_DIR / "logs"))
+STATE_FILE  = Path(os.environ.get("STATE_FILE", BASE_DIR / "state" / "scheduler.json"))
+HEARTBEAT_FILE = Path(os.environ.get("HEARTBEAT_FILE", "/tmp/thean-scheduler-heartbeat"))
 
 # ---------------------------------------------------------------------------
 # Defaults
@@ -28,6 +32,18 @@ WATCHDOG_INTERVAL  = 30
 RATE_LIMIT_WAIT    = 60
 SUMMARY_INTERVAL   = 30 * 60   # 30 minutes
 SUMMARY_HOLD       = 10        # seconds to show summary before clearing
+LOG_RETENTION_DAYS = int(os.environ.get("LOG_RETENTION_DAYS", "14"))
+
+
+def env_flag(name: str, default: bool = False) -> bool:
+    value = os.environ.get(name)
+    if value is None:
+        return default
+    return value.strip().lower() in {"1", "true", "yes", "on"}
+
+
+LOG_SUCCESSES   = env_flag("LOG_SUCCESSES", False)
+PRINT_SUCCESSES = env_flag("PRINT_SUCCESSES", False)
 
 # ---------------------------------------------------------------------------
 # Terminal colours
@@ -44,6 +60,7 @@ RESET  = "\033[0m"
 # ---------------------------------------------------------------------------
 _stats_lock = threading.Lock()
 _stats: dict = defaultdict(lambda: {"runs": 0, "success": 0, "failure": 0})
+_state_lock = threading.Lock()
 
 
 def record_stat(job_name: str, success: bool):
@@ -53,6 +70,44 @@ def record_stat(job_name: str, success: bool):
             _stats[job_name]["success"] += 1
         else:
             _stats[job_name]["failure"] += 1
+
+
+def load_state() -> dict:
+    try:
+        with open(STATE_FILE, "r", encoding="utf-8") as f:
+            state = json.load(f)
+        return state if isinstance(state, dict) else {}
+    except (FileNotFoundError, json.JSONDecodeError, OSError):
+        return {}
+
+
+_state = load_state()
+
+
+def record_timed_job_success(job_name: str):
+    with _state_lock:
+        _state[job_name] = datetime.now().astimezone().isoformat()
+        STATE_FILE.parent.mkdir(parents=True, exist_ok=True)
+        temporary = STATE_FILE.with_suffix(".tmp")
+        temporary.write_text(json.dumps(_state, indent=2), encoding="utf-8")
+        temporary.replace(STATE_FILE)
+
+
+def timed_job_needs_catch_up(job: dict) -> bool:
+    if not job.get("catch_up"):
+        return False
+    now = datetime.now().astimezone()
+    hours, minutes = map(int, job["run_at"].split(":"))
+    scheduled = now.replace(hour=hours, minute=minutes, second=0, microsecond=0)
+    if now < scheduled:
+        return False
+    try:
+        last_success = datetime.fromisoformat(_state.get(job["name"], ""))
+    except ValueError:
+        return True
+    if last_success.tzinfo is None:
+        last_success = last_success.astimezone()
+    return last_success < scheduled
 
 
 # ---------------------------------------------------------------------------
@@ -88,6 +143,29 @@ def _write_summary_file(content: str):
             f.write(content)
 
 
+def prune_old_logs():
+    if not LOG_DIR.exists():
+        return
+    cutoff = (datetime.now() - timedelta(days=LOG_RETENTION_DAYS)).date()
+    for child in LOG_DIR.iterdir():
+        if not child.is_dir():
+            continue
+        try:
+            log_date = datetime.strptime(child.name, "%Y-%m-%d").date()
+        except ValueError:
+            continue
+        if log_date < cutoff:
+            shutil.rmtree(child)
+
+
+def write_heartbeat():
+    try:
+        HEARTBEAT_FILE.parent.mkdir(parents=True, exist_ok=True)
+        HEARTBEAT_FILE.write_text(str(time.time()), encoding="ascii")
+    except OSError as exc:
+        log_warn(f"Unable to update scheduler heartbeat: {exc}")
+
+
 # ---------------------------------------------------------------------------
 # Terminal output
 # ---------------------------------------------------------------------------
@@ -118,13 +196,15 @@ def log_warn(msg: str):
 # ---------------------------------------------------------------------------
 def log_success(project: str, job_name: str, status_code):
     record_stat(job_name, True)
-    print_job_line(project, job_name, status_code, True)
-    _write_log("success", [
-        f"  PROJECT : {project}",
-        f"  JOB     : {job_name}",
-        f"  STATUS  : {status_code}",
-        f"  RESULT  : Success",
-    ])
+    if PRINT_SUCCESSES:
+        print_job_line(project, job_name, status_code, True)
+    if LOG_SUCCESSES:
+        _write_log("success", [
+            f"  PROJECT : {project}",
+            f"  JOB     : {job_name}",
+            f"  STATUS  : {status_code}",
+            f"  RESULT  : Success",
+        ])
 
 
 def log_failure(project: str, job_name: str, reason: str, status_code=None, body=None):
@@ -180,6 +260,7 @@ def print_summary_and_clear():
 
     # Write to daily summary file
     _write_summary_file(summary_text)
+    prune_old_logs()
 
     time.sleep(SUMMARY_HOLD)
     os.system("clear" if platform.system() != "Windows" else "cls")
@@ -204,12 +285,18 @@ def load_config():
 
     try:
         with open(CONFIG_FILE, "r", encoding="utf-8") as f:
-            config = json.load(f)
-    except json.JSONDecodeError as e:
+            raw_config = os.path.expandvars(f.read())
+        unresolved = sorted(set(re.findall(r"\$\{[A-Za-z_][A-Za-z0-9_]*\}", raw_config)))
+        if unresolved:
+            print(f"[ERROR] Unresolved environment variables in jobs.json: {', '.join(unresolved)}")
+            sys.exit(1)
+        config = json.loads(raw_config)
+    except (json.JSONDecodeError, OSError) as e:
         print(f"[ERROR] Malformed JSON in jobs.json: {e}")
         sys.exit(1)
 
     raw_jobs = config.get("jobs", [])
+    project_headers = config.get("project_headers", {})
     if not raw_jobs:
         print("[ERROR] No jobs found in jobs.json.")
         sys.exit(1)
@@ -254,6 +341,12 @@ def load_config():
                 log_warn(f"Job '{name}' has invalid interval '{interval}' — skipping.")
                 continue
 
+        inherited_headers = project_headers.get(project, {})
+        job_headers = job.get("headers", {})
+        if not isinstance(inherited_headers, dict) or not isinstance(job_headers, dict):
+            log_warn(f"Job '{name}' has invalid headers — skipping.")
+            continue
+
         seen_names.add(name)
         validated.append({
             "project":          project,
@@ -262,12 +355,13 @@ def load_config():
             "url":              job["url"],
             "run_at":           job.get("run_at"),
             "interval_seconds": float(job["interval_seconds"]) if has_interval else None,
-            "headers":          job.get("headers", {}),
+            "headers":          {**inherited_headers, **job_headers},
             "body":             job.get("body", None),
             "connect_timeout":  job.get("connect_timeout", 5),
             "read_timeout":     job.get("read_timeout", 10),
             "retry_count":      job.get("retry_count", RETRY_COUNT),
             "retry_delay":      job.get("retry_delay", RETRY_DELAY),
+            "catch_up":         bool(job.get("catch_up", False)),
         })
 
     if not validated:
@@ -328,11 +422,16 @@ def run_job(job):
 
         if success:
             log_success(project, name, status_code)
+            if job.get("run_at"):
+                record_timed_job_success(name)
             return
 
         is_last = attempt == max_retries
 
         if status_code == 429:
+            if is_last:
+                log_failure(project, name, reason, status_code, body)
+                return
             log_warn(f"[{project}][{name}] Rate limited. Waiting {RATE_LIMIT_WAIT}s (attempt {attempt}/{max_retries})")
             time.sleep(RATE_LIMIT_WAIT)
             continue
@@ -365,6 +464,13 @@ def timed_job_loop(job, stop_event):
     run_at  = job["run_at"]
     log_info(f"[{project}] Job '{name}' scheduled daily at {run_at}")
 
+    if timed_job_needs_catch_up(job):
+        log_info(f"[{project}] Job '{name}' missed today's {run_at} run; catching up now")
+        try:
+            run_job(job)
+        except Exception as e:
+            log_failure(project, name, f"Catch-up execution failed: {e}")
+
     while not stop_event.is_set():
         wait = seconds_until_next(run_at)
         log_info(f"[{project}] Job '{name}' next run in {int(wait)}s (at {run_at})")
@@ -386,6 +492,7 @@ def watchdog(threads, stop_event):
         stop_event.wait(WATCHDOG_INTERVAL)
         if stop_event.is_set():
             break
+        write_heartbeat()
         for name, thread in threads.items():
             if not thread.is_alive():
                 msg = f"Thread for job '{name}' died. Restarting app."
@@ -403,6 +510,9 @@ def main():
     log_info(f"Base dir : {BASE_DIR}")
     log_info(f"Config   : {CONFIG_FILE}")
     log_info(f"Logs     : {LOG_DIR}")
+
+    prune_old_logs()
+    write_heartbeat()
 
     log_info(f"Waiting {STARTUP_DELAY}s for network to stabilize...")
     time.sleep(STARTUP_DELAY)

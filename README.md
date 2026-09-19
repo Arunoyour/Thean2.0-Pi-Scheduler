@@ -1,8 +1,35 @@
 # Thean Scheduler
 
-A lightweight API job scheduler for Raspberry Pi 3 (32-bit).  
+A lightweight API job scheduler for Raspberry Pi or Docker.
 Reads jobs from a JSON config file, POSTs to each URL on a set interval, and logs failures in human-readable format.  
-Runs automatically on boot via systemd.
+Runs automatically through systemd on a Pi or Docker Compose on a server.
+
+## Hostinger / Docker deployment
+
+The production container owns all Thean and CoCo Cabs schedules. It publishes no
+port and joins Thean's private Docker network so cron triggers never traverse the
+public internet.
+
+Before starting it, configure Thean with the same random secret and disable its
+in-process jobs:
+
+```env
+INTERNAL_JOBS_ENABLED=false
+CRON_SECRET=<random 32+ character secret>
+```
+
+Create `deploy/hostinger/.env` from `.env.example`, using that secret for
+`THEAN_CRON_SECRET`, then validate the stack:
+
+```bash
+docker compose --env-file deploy/hostinger/.env \
+  -f deploy/hostinger/compose.yml config --quiet
+```
+
+The stack uses `restart: unless-stopped`, a 256 MB memory limit,
+`Asia/Kolkata`, persistent catch-up state, a heartbeat health check, and bounded
+Docker logs. Do not install `thean-watchdog.service` on a shared VPS: its Pi-only
+policy can reboot the whole host.
 
 ---
 
@@ -21,6 +48,8 @@ Open a terminal on the Pi and run:
 ```bash
 git clone https://github.com/Arunoyour/Thean2.0-Pi-Scheduler ~/Desktop/Thean_scheduler
 cd ~/Desktop/Thean_scheduler
+cp .env.example .env
+# Edit .env with the reachable Thean API URL and its CRON_SECRET.
 bash install.sh
 ```
 
@@ -34,11 +63,14 @@ The install script will:
 
 ## Configuration
 
-Edit `jobs.json` to define your jobs. The top-level `sql_connection` field is shared across all SP and FCM jobs:
+Environment placeholders are expanded before the JSON is parsed. Production uses
+them for Thean's private base URL and cron credential:
 
 ```json
 {
-  "sql_connection": "Server=YOUR_SERVER;Database=YOUR_DB;User=YOUR_USER;Password=YOUR_PASSWORD",
+  "project_headers": {
+    "THEAN": {"X-Cron-Secret": "${THEAN_CRON_SECRET}"}
+  },
   "jobs": [...]
 }
 ```
@@ -75,10 +107,8 @@ Edit `jobs.json` to define your jobs. The top-level `sql_connection` field is sh
 | `retry_delay` | No | `30` | Seconds between retries |
 | `run_at` | No | — | Exact daily time to run in `HH:MM` (24h format). Use instead of `interval_seconds` for daily jobs. e.g. `"run_at": "00:00"` fires at midnight every day |
 | `project` | No | `UNKNOWN` | Label for filtering logs e.g. `THEAN` or `COCO CABS` |
-| `type` | No | `http` | Job type: `http`, `sp` (stored procedure), or `fcm` (Firebase push notification) |
-| `procedure` | For `sp`/`fcm` | — | SQL stored procedure name e.g. `coco.uspDbAssignScheduledTripToDrivers` |
-| `has_output_params` | For `sp` | `true` | Whether the SP returns `@status_cd` and `@status_desc` output params |
-| `firebase_credential` | For `fcm` | — | Path to Firebase Admin SDK JSON file, relative to `main.py` |
+| `type` | No | `http` | Job type. The current runtime accepts HTTP jobs only. |
+| `catch_up` | No | `false` | For daily jobs, run after restart when today's scheduled run was missed. |
 
 To apply config changes without reinstalling:
 
@@ -90,9 +120,10 @@ sudo systemctl restart thean-scheduler
 
 ## Logs
 
-Failures are written to `logs/errors.log` next to `main.py`.  
-Log files rotate automatically at 5MB (3 backups kept).  
-Successful requests are silent — nothing is logged.
+Failures are written to hourly files under `logs/YYYY-MM-DD/`. Summaries are
+written every 30 minutes. Successful requests are silent by default; set
+`LOG_SUCCESSES=true` only while diagnosing a problem. Dated log folders older
+than `LOG_RETENTION_DAYS` (14 by default) are removed automatically.
 
 ### Example Log Entry
 
@@ -108,7 +139,8 @@ Successful requests are silent — nothing is logged.
 ### Watch Logs Live
 
 ```bash
-tail -f ~/Desktop/Thean_scheduler/logs/errors.log
+find ~/Desktop/Thean_scheduler/logs -type f -name '*_error.log' -print0 \
+  | xargs -0 tail -F
 ```
 
 ---
@@ -135,7 +167,8 @@ sudo systemctl disable thean-scheduler    # remove from autostart
 | Rate limit (429) | Waits 60s before retrying |
 | Thread watchdog | Detects dead job threads and restarts the app |
 | Graceful shutdown | Finishes in-flight requests before stopping |
-| Log rotation | Caps log file at 5MB, keeps 3 backups |
+| Log retention | Deletes dated log folders after 14 days by default |
+| Daily catch-up | Runs opted-in daily jobs after a restart if today's run was missed |
 | Config validation | Validates all jobs on startup, skips invalid entries |
 | Disk full handling | Catches write errors without crashing |
 
@@ -160,10 +193,12 @@ The script pulls the latest code, updates the service, and restarts automaticall
 Thean_scheduler/
 ├── main.py                  # Scheduler application
 ├── jobs.json                # Job configuration
+├── requirements.txt         # Python dependency pin range
+├── Dockerfile               # Production scheduler image
 ├── install.sh               # Installer script
 ├── thean-scheduler.service  # Systemd service reference
-└── logs/
-    └── errors.log           # Failure log
+├── state/                   # Persistent daily-job catch-up state
+└── logs/YYYY-MM-DD/         # Hourly failures and daily summaries
 ```
 
 ---
@@ -172,8 +207,9 @@ Thean_scheduler/
 
 | Resource | Usage |
 |----------|-------|
-| RAM (10 jobs) | ~220 MB |
+| RAM | Capped at 256 MB in the Docker deployment |
 | CPU (idle) | < 1% |
-| Disk (logs) | Max 15 MB (3 × 5MB files) |
+| Disk (logs) | Bounded by 14-day app-log retention and Docker log rotation |
 
-Well within the Raspberry Pi 3's 1GB RAM limit.
+The scheduler is designed to coexist with the application containers on the
+2 GB Hostinger VPS.

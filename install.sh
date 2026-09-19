@@ -149,6 +149,7 @@ Type=simple
 User=$CURRENT_USER
 ExecStart=$PYTHON_BIN $INSTALL_DIR/main.py
 WorkingDirectory=$INSTALL_DIR
+EnvironmentFile=-$INSTALL_DIR/.env
 Restart=always
 RestartSec=10
 MemoryMax=200M
@@ -220,14 +221,13 @@ echo ""
 # ---------------------------------------------------------------------------
 # Show last 100 log entries
 # ---------------------------------------------------------------------------
-LOG_FILE="$INSTALL_DIR/logs/errors.log"
-
 echo -e "${CYAN}================================================${NC}"
 echo -e "${CYAN}           Last 100 Log Entries                 ${NC}"
 echo -e "${CYAN}================================================${NC}"
 
-if [ -f "$LOG_FILE" ]; then
-    tail -n 100 "$LOG_FILE"
+LATEST_LOG=$(find "$INSTALL_DIR/logs" -type f -name '*_error.log' -printf '%T@ %p\n' 2>/dev/null | sort -n | tail -1 | cut -d' ' -f2-)
+if [ -n "$LATEST_LOG" ] && [ -f "$LATEST_LOG" ]; then
+    tail -n 100 "$LATEST_LOG"
 else
     warn "No log file yet. This is normal on first run — logs only appear on job failures."
 fi
@@ -241,7 +241,7 @@ echo -e "  ${CYAN}sudo systemctl status $SERVICE_NAME${NC}      — scheduler st
 echo -e "  ${CYAN}sudo systemctl status $WATCHDOG_NAME${NC}      — watchdog status"
 echo -e "  ${CYAN}sudo systemctl restart $SERVICE_NAME${NC}     — restart scheduler"
 echo -e "  ${CYAN}sudo systemctl stop $WATCHDOG_NAME${NC}        — stop watchdog"
-echo -e "  ${CYAN}tail -f $INSTALL_DIR/logs/errors.log${NC}"
+echo -e "  ${CYAN}find $INSTALL_DIR/logs -type f -name '*_error.log' -print0 | xargs -0 tail -F${NC}"
 echo -e "                                              — watch live logs"
 echo -e "${CYAN}================================================${NC}"
 echo ""

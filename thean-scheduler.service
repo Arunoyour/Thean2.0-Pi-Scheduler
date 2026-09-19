@@ -8,6 +8,7 @@ Type=simple
 # Update this path to wherever you placed the Thean_scheduler folder
 ExecStart=/usr/bin/python3 /home/pi/Thean_scheduler/main.py
 WorkingDirectory=/home/pi/Thean_scheduler
+EnvironmentFile=-/home/pi/Thean_scheduler/.env
 Restart=always
 RestartSec=10
 # Restart if the process uses more than 200MB RAM
