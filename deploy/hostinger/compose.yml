@@ -1,0 +1,49 @@
+name: thean-scheduler
+
+services:
+  scheduler:
+    image: thean-scheduler:hostinger
+    build:
+      context: ../..
+    env_file:
+      - .env
+    environment:
+      CONFIG_FILE: /app/jobs.json
+      LOG_DIR: /app/logs
+      STATE_FILE: /app/state/scheduler.json
+      HEARTBEAT_FILE: /tmp/thean-scheduler-heartbeat
+    volumes:
+      - scheduler-logs:/app/logs
+      - scheduler-state:/app/state
+    restart: unless-stopped
+    init: true
+    mem_limit: 256m
+    cpus: 0.20
+    security_opt:
+      - no-new-privileges:true
+    healthcheck:
+      test:
+        - CMD
+        - python
+        - -c
+        - "import os,time; p='/tmp/thean-scheduler-heartbeat'; assert os.path.exists(p) and time.time()-os.path.getmtime(p)<90"
+      interval: 30s
+      timeout: 5s
+      start_period: 75s
+      retries: 3
+    logging:
+      driver: json-file
+      options:
+        max-size: 10m
+        max-file: "3"
+    networks:
+      - thean-internal
+
+networks:
+  thean-internal:
+    external: true
+    name: thean_thean-internal
+
+volumes:
+  scheduler-logs:
+  scheduler-state:

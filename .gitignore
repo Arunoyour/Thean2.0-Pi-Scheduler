@@ -1,0 +1,7 @@
+__pycache__/
+*.pyc
+.env
+logs/
+state/
+deploy/hostinger/.env
+deploy/hostinger/*.tar.gz
