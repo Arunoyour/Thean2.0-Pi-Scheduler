@@ -2,8 +2,10 @@ import json
 import os
 import sys
 import tempfile
+import threading
 import types
 import unittest
+import urllib.request
 from pathlib import Path
 from unittest.mock import patch
 
@@ -30,14 +32,20 @@ class SchedulerConfigTests(unittest.TestCase):
         self.original_config = main.CONFIG_FILE
         self.original_state_file = main.STATE_FILE
         self.original_state = main._state
+        self.original_job_status = main._job_status
+        self.original_heartbeat_file = main.HEARTBEAT_FILE
         main.CONFIG_FILE = Path(self.temp_dir.name) / "jobs.json"
         main.STATE_FILE = Path(self.temp_dir.name) / "state" / "scheduler.json"
         main._state = {}
+        main._job_status = {}
+        main.HEARTBEAT_FILE = Path(self.temp_dir.name) / "heartbeat"
 
     def tearDown(self):
         main.CONFIG_FILE = self.original_config
         main.STATE_FILE = self.original_state_file
         main._state = self.original_state
+        main._job_status = self.original_job_status
+        main.HEARTBEAT_FILE = self.original_heartbeat_file
 
     def write_config(self, data):
         main.CONFIG_FILE.write_text(json.dumps(data), encoding="utf-8")
@@ -133,6 +141,66 @@ class SchedulerConfigTests(unittest.TestCase):
         persisted = json.loads(main.STATE_FILE.read_text(encoding="utf-8"))
         self.assertIn("daily-job", persisted)
         self.assertEqual(persisted, main._state)
+
+    def test_run_job_exposes_success_status(self):
+        job = {
+            "project": "COCO CABS",
+            "name": "poll-job",
+            "interval_seconds": 15,
+            "run_at": None,
+            "retry_count": 1,
+            "retry_delay": 0,
+        }
+        main.register_jobs([job])
+
+        with patch.object(main, "http_post_once", return_value=(True, None, 204, None)):
+            main.run_job(job)
+
+        status = main._job_status["poll-job"]
+        self.assertEqual(status["status"], "Success")
+        self.assertEqual(status["http_status"], 204)
+        self.assertEqual(status["success_count"], 1)
+        self.assertIsNotNone(status["last_started_at"])
+        self.assertIsNotNone(status["last_completed_at"])
+
+    def test_status_payload_filters_no_secrets_from_job_config(self):
+        job = {
+            "project": "THEAN",
+            "name": "private-job",
+            "interval_seconds": 60,
+            "run_at": None,
+            "headers": {"X-Cron-Secret": "must-not-leak"},
+            "url": "http://private/api",
+        }
+        main.register_jobs([job])
+
+        payload = main.build_status_payload()
+        serialized = json.dumps(payload)
+        self.assertNotIn("must-not-leak", serialized)
+        self.assertNotIn("http://private/api", serialized)
+
+    def test_status_http_endpoint_returns_live_job_data(self):
+        main.HEARTBEAT_FILE.write_text("alive", encoding="ascii")
+        main.register_jobs([{
+            "project": "COCO CABS",
+            "name": "poll-job",
+            "interval_seconds": 15,
+            "run_at": None,
+        }])
+        server = main.ThreadingHTTPServer(("127.0.0.1", 0), main.StatusRequestHandler)
+        thread = threading.Thread(target=server.handle_request)
+        thread.start()
+        try:
+            with urllib.request.urlopen(
+                f"http://127.0.0.1:{server.server_port}/status", timeout=2
+            ) as response:
+                payload = json.loads(response.read().decode("utf-8"))
+            self.assertEqual(response.status, 200)
+            self.assertEqual(payload["status"], "healthy")
+            self.assertEqual(payload["jobs"][0]["name"], "poll-job")
+        finally:
+            thread.join(timeout=2)
+            server.server_close()
 
 
 if __name__ == "__main__":

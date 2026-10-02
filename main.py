@@ -7,6 +7,7 @@ import time
 import threading
 import platform
 import signal
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from datetime import datetime, timedelta
 from collections import defaultdict
@@ -21,6 +22,8 @@ CONFIG_FILE = Path(os.environ.get("CONFIG_FILE", BASE_DIR / "jobs.json"))
 LOG_DIR     = Path(os.environ.get("LOG_DIR", BASE_DIR / "logs"))
 STATE_FILE  = Path(os.environ.get("STATE_FILE", BASE_DIR / "state" / "scheduler.json"))
 HEARTBEAT_FILE = Path(os.environ.get("HEARTBEAT_FILE", "/tmp/thean-scheduler-heartbeat"))
+STATUS_HOST = os.environ.get("STATUS_HOST", "0.0.0.0")
+STATUS_PORT = int(os.environ.get("STATUS_PORT", "8090"))
 
 # ---------------------------------------------------------------------------
 # Defaults
@@ -61,6 +64,9 @@ RESET  = "\033[0m"
 _stats_lock = threading.Lock()
 _stats: dict = defaultdict(lambda: {"runs": 0, "success": 0, "failure": 0})
 _state_lock = threading.Lock()
+_job_status_lock = threading.Lock()
+_job_status: dict = {}
+_scheduler_started_at = datetime.now().astimezone().isoformat()
 
 
 def record_stat(job_name: str, success: bool):
@@ -70,6 +76,120 @@ def record_stat(job_name: str, success: bool):
             _stats[job_name]["success"] += 1
         else:
             _stats[job_name]["failure"] += 1
+
+
+def register_jobs(jobs: list):
+    with _job_status_lock:
+        _job_status.clear()
+        for job in jobs:
+            _job_status[job["name"]] = {
+                "name": job["name"],
+                "project": job["project"],
+                "interval_seconds": job.get("interval_seconds"),
+                "run_at": job.get("run_at"),
+                "status": "Not run",
+                "last_started_at": None,
+                "last_completed_at": None,
+                "duration_ms": None,
+                "http_status": None,
+                "message": "Waiting for the first scheduled run.",
+                "success_count": 0,
+                "failure_count": 0,
+            }
+
+
+def record_job_started(job: dict):
+    with _job_status_lock:
+        status = _job_status.setdefault(job["name"], {
+            "name": job["name"],
+            "project": job["project"],
+        })
+        status.update({
+            "status": "Running",
+            "last_started_at": datetime.now().astimezone().isoformat(),
+            "last_completed_at": None,
+            "duration_ms": None,
+            "http_status": None,
+            "message": "Calling the configured API.",
+        })
+
+
+def record_job_completed(job: dict, success: bool, status_code=None, reason=None):
+    completed_at = datetime.now().astimezone()
+    with _job_status_lock:
+        status = _job_status.setdefault(job["name"], {
+            "name": job["name"],
+            "project": job["project"],
+            "success_count": 0,
+            "failure_count": 0,
+        })
+        try:
+            started_at = datetime.fromisoformat(status.get("last_started_at") or "")
+            duration_ms = max(0, round((completed_at - started_at).total_seconds() * 1000))
+        except ValueError:
+            duration_ms = None
+        status.update({
+            "status": "Success" if success else "Failure",
+            "last_completed_at": completed_at.isoformat(),
+            "duration_ms": duration_ms,
+            "http_status": status_code,
+            "message": "API completed successfully." if success else (reason or "API call failed."),
+        })
+        counter = "success_count" if success else "failure_count"
+        status[counter] = int(status.get(counter, 0)) + 1
+
+
+def build_status_payload() -> dict:
+    try:
+        heartbeat_mtime = HEARTBEAT_FILE.stat().st_mtime
+        heartbeat_at = datetime.fromtimestamp(heartbeat_mtime).astimezone()
+        heartbeat_age_seconds = max(0, round(time.time() - heartbeat_mtime, 1))
+        heartbeat = heartbeat_at.isoformat()
+    except OSError:
+        heartbeat = None
+        heartbeat_age_seconds = None
+
+    with _job_status_lock:
+        jobs = [dict(value) for value in _job_status.values()]
+
+    return {
+        "status": "healthy" if heartbeat_age_seconds is not None and heartbeat_age_seconds < 90 else "stale",
+        "started_at": _scheduler_started_at,
+        "heartbeat_at": heartbeat,
+        "heartbeat_age_seconds": heartbeat_age_seconds,
+        "jobs": jobs,
+    }
+
+
+class StatusRequestHandler(BaseHTTPRequestHandler):
+    def do_GET(self):
+        if self.path.rstrip("/") not in {"/health", "/status"}:
+            self.send_error(404)
+            return
+
+        payload = build_status_payload()
+        body = json.dumps(payload).encode("utf-8")
+        response_code = 200 if payload["status"] == "healthy" else 503
+        self.send_response(response_code)
+        self.send_header("Content-Type", "application/json; charset=utf-8")
+        self.send_header("Cache-Control", "no-store")
+        self.send_header("Content-Length", str(len(body)))
+        self.end_headers()
+        self.wfile.write(body)
+
+    def log_message(self, format, *args):
+        return
+
+
+def serve_status(stop_event):
+    server = ThreadingHTTPServer((STATUS_HOST, STATUS_PORT), StatusRequestHandler)
+    server.timeout = 1
+    log_info(f"Scheduler status API listening on {STATUS_HOST}:{STATUS_PORT}")
+    try:
+        while not stop_event.is_set():
+            server.handle_request()
+    finally:
+        server.server_close()
 
 
 def load_state() -> dict:
@@ -416,12 +536,14 @@ def run_job(job):
     project     = job["project"]
     max_retries = job["retry_count"]
     retry_delay = job["retry_delay"]
+    record_job_started(job)
 
     for attempt in range(1, max_retries + 1):
         success, reason, status_code, body = http_post_once(job)
 
         if success:
             log_success(project, name, status_code)
+            record_job_completed(job, True, status_code)
             if job.get("run_at"):
                 record_timed_job_success(name)
             return
@@ -431,6 +553,7 @@ def run_job(job):
         if status_code == 429:
             if is_last:
                 log_failure(project, name, reason, status_code, body)
+                record_job_completed(job, False, status_code, reason)
                 return
             log_warn(f"[{project}][{name}] Rate limited. Waiting {RATE_LIMIT_WAIT}s (attempt {attempt}/{max_retries})")
             time.sleep(RATE_LIMIT_WAIT)
@@ -441,6 +564,7 @@ def run_job(job):
             time.sleep(retry_delay)
         else:
             log_failure(project, name, reason, status_code, body)
+            record_job_completed(job, False, status_code, reason)
 
 
 # ---------------------------------------------------------------------------
@@ -455,6 +579,7 @@ def interval_job_loop(job, stop_event):
             run_job(job)
         except Exception as e:
             log_failure(job["project"], job["name"], f"Unhandled thread exception: {e}")
+            record_job_completed(job, False, reason=f"Unhandled thread exception: {e}")
         stop_event.wait(interval)
 
 
@@ -470,6 +595,7 @@ def timed_job_loop(job, stop_event):
             run_job(job)
         except Exception as e:
             log_failure(project, name, f"Catch-up execution failed: {e}")
+            record_job_completed(job, False, reason=f"Catch-up execution failed: {e}")
 
     while not stop_event.is_set():
         wait = seconds_until_next(run_at)
@@ -481,6 +607,7 @@ def timed_job_loop(job, stop_event):
             run_job(job)
         except Exception as e:
             log_failure(project, name, f"Unhandled thread exception: {e}")
+            record_job_completed(job, False, reason=f"Unhandled thread exception: {e}")
         stop_event.wait(61)
 
 
@@ -519,6 +646,7 @@ def main():
 
     jobs = load_config()
     log_info(f"Loaded {len(jobs)} job(s)")
+    register_jobs(jobs)
 
     stop_event = threading.Event()
     threads    = {}
@@ -529,6 +657,13 @@ def main():
 
     signal.signal(signal.SIGTERM, shutdown)
     signal.signal(signal.SIGINT,  shutdown)
+
+    threading.Thread(
+        target=serve_status,
+        args=(stop_event,),
+        name="status-api",
+        daemon=True
+    ).start()
 
     if platform.system() != "Windows":
         def reload_config_signal(signum, frame):

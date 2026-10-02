@@ -12,6 +12,10 @@ services:
       LOG_DIR: /app/logs
       STATE_FILE: /app/state/scheduler.json
       HEARTBEAT_FILE: /tmp/thean-scheduler-heartbeat
+      STATUS_HOST: 0.0.0.0
+      STATUS_PORT: 8090
+    expose:
+      - "8090"
     volumes:
       - scheduler-logs:/app/logs
       - scheduler-state:/app/state
@@ -38,11 +42,15 @@ services:
         max-file: "3"
     networks:
       - thean-internal
+      - admin-internal
 
 networks:
   thean-internal:
     external: true
     name: thean_thean-internal
+  admin-internal:
+    external: true
+    name: coco-admin_admin-internal
 
 volumes:
   scheduler-logs:

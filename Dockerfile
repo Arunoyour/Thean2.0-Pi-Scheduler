@@ -19,4 +19,6 @@ RUN mkdir -p /app/logs /app/state \
 
 USER scheduler
 
+EXPOSE 8090
+
 CMD ["python", "main.py"]
