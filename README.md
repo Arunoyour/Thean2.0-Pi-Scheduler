@@ -7,8 +7,9 @@ Runs automatically through systemd on a Pi or Docker Compose on a server.
 ## Hostinger / Docker deployment
 
 The production container owns all Thean and CoCo Cabs schedules. It publishes no
-port and joins Thean's private Docker network so cron triggers never traverse the
-public internet.
+host port and joins the private Thean and COCO Admin Docker networks. The Admin UI
+reads heartbeat and per-job results from the scheduler's internal status API on
+port 8090, while cron triggers never traverse the public internet.
 
 Before starting it, configure Thean with the same random secret and disable its
 in-process jobs:
@@ -25,6 +26,9 @@ Create `deploy/hostinger/.env` from `.env.example`, using that secret for
 docker compose --env-file deploy/hostinger/.env \
   -f deploy/hostinger/compose.yml config --quiet
 ```
+
+Start the COCO Admin stack before the scheduler so its private
+`coco-admin_admin-internal` network exists.
 
 The stack uses `restart: unless-stopped`, a 256 MB memory limit,
 `Asia/Kolkata`, persistent catch-up state, a heartbeat health check, and bounded
@@ -170,6 +174,7 @@ sudo systemctl disable thean-scheduler    # remove from autostart
 | Log retention | Deletes dated log folders after 14 days by default |
 | Daily catch-up | Runs opted-in daily jobs after a restart if today's run was missed |
 | Config validation | Validates all jobs on startup, skips invalid entries |
+| Admin monitoring | Reports heartbeat and per-job result data over the private Docker network |
 | Disk full handling | Catches write errors without crashing |
 
 ---
