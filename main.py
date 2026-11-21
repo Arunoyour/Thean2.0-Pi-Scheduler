@@ -8,6 +8,7 @@ import threading
 import platform
 import signal
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+from urllib.parse import urlsplit
 from pathlib import Path
 from datetime import datetime, timedelta
 from collections import defaultdict
@@ -405,12 +406,27 @@ def load_config():
 
     try:
         with open(CONFIG_FILE, "r", encoding="utf-8") as f:
-            raw_config = os.path.expandvars(f.read())
-        unresolved = sorted(set(re.findall(r"\$\{[A-Za-z_][A-Za-z0-9_]*\}", raw_config)))
+            config = json.load(f)
+        # Disabled jobs are omitted before resolving credentials; they cannot run and
+        # must not prevent unrelated jobs from starting when their secrets are absent.
+        for job in config.get("jobs", []):
+            if "enabled" in job and not isinstance(job["enabled"], bool):
+                print("[ERROR] Job enabled must be a JSON boolean.")
+                sys.exit(1)
+        config["jobs"] = [job for job in config.get("jobs", []) if job.get("enabled", True)]
+        def expand(value):
+            if isinstance(value, str):
+                return os.path.expandvars(value)
+            if isinstance(value, list):
+                return [expand(item) for item in value]
+            if isinstance(value, dict):
+                return {key: expand(item) for key, item in value.items()}
+            return value
+        config = expand(config)
+        unresolved = sorted(set(re.findall(r"\$\{[A-Za-z_][A-Za-z0-9_]*\}", json.dumps(config))))
         if unresolved:
             print(f"[ERROR] Unresolved environment variables in jobs.json: {', '.join(unresolved)}")
             sys.exit(1)
-        config = json.loads(raw_config)
     except (json.JSONDecodeError, OSError) as e:
         print(f"[ERROR] Malformed JSON in jobs.json: {e}")
         sys.exit(1)
@@ -467,6 +483,14 @@ def load_config():
             log_warn(f"Job '{name}' has invalid headers — skipping.")
             continue
 
+        if name == "PromoReservationCleanup":
+            parsed = urlsplit(job["url"])
+            secret = job_headers.get("X-Coco-Promo-Cleanup-Secret", "")
+            if (parsed.scheme != "https" or not parsed.hostname or parsed.username or parsed.password
+                    or not isinstance(secret, str) or len(secret.encode("utf-8")) < 32):
+                print("[ERROR] Promo cleanup requires an HTTPS URL and a configured secret of at least 32 bytes.")
+                sys.exit(1)
+
         seen_names.add(name)
         validated.append({
             "project":          project,
@@ -482,6 +506,7 @@ def load_config():
             "retry_count":      job.get("retry_count", RETRY_COUNT),
             "retry_delay":      job.get("retry_delay", RETRY_DELAY),
             "catch_up":         bool(job.get("catch_up", False)),
+            "require_business_success": job.get("require_business_success", False) is True,
         })
 
     if not validated:
@@ -508,15 +533,30 @@ def seconds_until_next(run_at: str) -> float:
 # ---------------------------------------------------------------------------
 def http_post_once(job):
     try:
+        # requests forwards custom headers on redirects. Never forward the cleanup
+        # credential to an unverified redirect target.
+        redirect_options = {"allow_redirects": False} if job.get("name") == "PromoReservationCleanup" else {}
         response = requests.post(
             job["url"],
             json=job["body"] if job["body"] is not None else None,
             headers=job["headers"],
-            timeout=(job["connect_timeout"], job["read_timeout"])
+            timeout=(job["connect_timeout"], job["read_timeout"]),
+            **redirect_options
         )
         if response.status_code == 429:
             return False, "Rate limited (429)", 429, response.text
         if 200 <= response.status_code < 300:
+            if job.get("require_business_success", False):
+                try:
+                    result = response.json()
+                except (ValueError, TypeError):
+                    return False, "Invalid JSON business result", response.status_code, response.text
+                if not isinstance(result, dict):
+                    return False, "Missing business result", response.status_code, response.text
+                success = result.get("status_cd", result.get("Status_cd"))
+                if success is not True:
+                    detail = result.get("status_Desc", result.get("Status_Desc", "Business success was not confirmed"))
+                    return False, "API business failure: " + str(detail)[:300], response.status_code, response.text
             return True, None, response.status_code, None
         return False, response.reason, response.status_code, response.text
     except requests.exceptions.ConnectTimeout:

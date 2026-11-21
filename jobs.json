@@ -7,6 +7,22 @@
   "jobs": [
 
     {
+      "project": "COCO CABS",
+      "type": "http",
+      "name": "PromoReservationCleanup",
+      "enabled": false,
+      "url": "${COCO_PROMO_CLEANUP_URL}",
+      "headers": {
+        "X-Coco-Promo-Cleanup-Secret": "${COCO_PROMO_CLEANUP_SECRET}"
+      },
+      "interval_seconds": 300,
+      "connect_timeout": 5,
+      "read_timeout": 120,
+      "retry_count": 3,
+      "retry_delay": 30,
+      "require_business_success": true
+    },
+    {
       "project": "THEAN",
       "type": "http",
       "name": "sla_order_transitions",

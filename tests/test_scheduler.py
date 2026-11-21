@@ -114,6 +114,73 @@ class SchedulerConfigTests(unittest.TestCase):
             with self.assertRaises(SystemExit):
                 main.load_config()
 
+    def test_disabled_job_does_not_require_secrets_or_run(self):
+        self.write_config({"jobs": [
+            {"name": "regular", "url": "https://example.test", "interval_seconds": 60},
+            {"name": "cleanup", "enabled": False, "url": "${MISSING_CLEANUP_URL}",
+             "headers": {"X-Coco-Promo-Cleanup-Secret": "${MISSING_CLEANUP_SECRET}"}, "interval_seconds": 300},
+        ]})
+        with patch.dict(os.environ, {}, clear=False):
+            os.environ.pop("MISSING_CLEANUP_URL", None)
+            os.environ.pop("MISSING_CLEANUP_SECRET", None)
+            self.assertEqual([job["name"] for job in main.load_config()], ["regular"])
+
+    def test_enabling_cleanup_requires_its_configuration(self):
+        self.write_config({"jobs": [{"name": "cleanup", "enabled": True,
+            "url": "${MISSING_CLEANUP_URL}", "interval_seconds": 300}]})
+        with patch.dict(os.environ, {}, clear=False):
+            os.environ.pop("MISSING_CLEANUP_URL", None)
+            with self.assertRaises(SystemExit): main.load_config()
+
+    def test_enabled_must_be_boolean(self):
+        self.write_config({"jobs": [{"name": "cleanup", "enabled": "false",
+            "url": "https://example.test", "interval_seconds": 300}]})
+        with self.assertRaises(SystemExit): main.load_config()
+
+    def test_cleanup_requires_https_and_secret_before_activation(self):
+        job = {"name": "PromoReservationCleanup", "enabled": True,
+               "url": "http://example.test/cleanup", "interval_seconds": 300,
+               "headers": {"X-Coco-Promo-Cleanup-Secret": "x" * 32}}
+        self.write_config({"jobs": [job]})
+        with self.assertRaises(SystemExit): main.load_config()
+        job["url"] = "https://example.test/cleanup"
+        job["headers"]["X-Coco-Promo-Cleanup-Secret"] = "short"
+        self.write_config({"jobs": [job]})
+        with self.assertRaises(SystemExit): main.load_config()
+        job["headers"]["X-Coco-Promo-Cleanup-Secret"] = "x" * 32
+        self.write_config({"jobs": [job]})
+        self.assertEqual(main.load_config()[0]["name"], "PromoReservationCleanup")
+
+    def test_business_status_is_required_only_for_opted_in_jobs(self):
+        job = {"url": "http://local/assignment", "body": None, "headers": {},
+               "connect_timeout": 3, "read_timeout": 8, "require_business_success": True}
+        for payload in ({"status_cd": False, "status_Desc": "SQL failed"},
+                        {"status_cd": None}, {"status_cd": "true"}, {}, [], {"status_cd": 1}):
+            with self.subTest(payload=payload):
+                response = unittest.mock.Mock(status_code=200, text="synthetic", reason="OK")
+                response.json.return_value = payload
+                with patch.object(main.requests, "post", return_value=response):
+                    self.assertFalse(main.http_post_once(job)[0])
+        for key in ("status_cd", "Status_cd"):
+            response.json.return_value = {key: True}
+            with patch.object(main.requests, "post", return_value=response):
+                self.assertTrue(main.http_post_once(job)[0])
+        response.json.side_effect = ValueError("invalid")
+        with patch.object(main.requests, "post", return_value=response):
+            self.assertFalse(main.http_post_once(job)[0])
+            self.assertTrue(main.http_post_once({**job, "require_business_success": False})[0])
+        response.status_code = 500
+        with patch.object(main.requests, "post", return_value=response):
+            self.assertFalse(main.http_post_once(job)[0])
+
+    def test_promo_cleanup_requires_business_success_when_enabled(self):
+        config = json.loads((Path(main.__file__).parent / "jobs.json").read_text(encoding="utf-8"))
+        jobs = config["jobs"]
+        cleanup = next(j for j in jobs if j["name"] == "PromoReservationCleanup")
+        self.assertIs(cleanup["enabled"], False)
+        self.assertEqual(cleanup["interval_seconds"], 300)
+        self.assertIs(cleanup["require_business_success"], True)
+
     def test_http_post_once_passes_headers_and_timeouts(self):
         job = {
             "url": "http://backend:8000/api/v1/cron/jobs/job/run",
@@ -134,6 +201,22 @@ class SchedulerConfigTests(unittest.TestCase):
             headers={"X-Cron-Secret": "secret-value"},
             timeout=(3, 8),
         )
+
+    def test_cleanup_refuses_redirects_and_checks_business_result(self):
+        job = {"name": "PromoReservationCleanup", "url": "https://example.test/cleanup",
+               "body": None, "headers": {"X-Coco-Promo-Cleanup-Secret": "x" * 32},
+               "connect_timeout": 5, "read_timeout": 120, "require_business_success": True}
+        response = unittest.mock.Mock(status_code=302, text="redirect", reason="Found")
+        with patch.object(main.requests, "post", return_value=response) as post:
+            self.assertFalse(main.http_post_once(job)[0])
+            self.assertIs(post.call_args.kwargs["allow_redirects"], False)
+        response.status_code = 200
+        response.json.return_value = {"status_cd": False}
+        with patch.object(main.requests, "post", return_value=response):
+            self.assertFalse(main.http_post_once(job)[0])
+        response.json.return_value = {"status_cd": True, "released": 1}
+        with patch.object(main.requests, "post", return_value=response):
+            self.assertTrue(main.http_post_once(job)[0])
 
     def test_timed_job_success_is_persisted(self):
         main.record_timed_job_success("daily-job")
