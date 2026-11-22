@@ -202,7 +202,8 @@
       "connect_timeout": 5,
       "read_timeout": 10,
       "retry_count": 3,
-      "retry_delay": 15
+      "retry_delay": 15,
+      "require_business_success": true
     },
     {
       "project": "COCO CABS",
@@ -213,7 +214,8 @@
       "connect_timeout": 5,
       "read_timeout": 10,
       "retry_count": 3,
-      "retry_delay": 15
+      "retry_delay": 15,
+      "require_business_success": true
     },
     {
       "project": "COCO CABS",
@@ -301,7 +303,8 @@
       "connect_timeout": 5,
       "read_timeout": 10,
       "retry_count": 3,
-      "retry_delay": 15
+      "retry_delay": 15,
+      "require_business_success": true
     }
 
   ]

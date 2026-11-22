@@ -173,6 +173,15 @@ class SchedulerConfigTests(unittest.TestCase):
         with patch.object(main.requests, "post", return_value=response):
             self.assertFalse(main.http_post_once(job)[0])
 
+    def test_coco_assignment_and_cancellation_jobs_require_business_success(self):
+        config = json.loads((Path(main.__file__).parent / "jobs.json").read_text(encoding="utf-8"))
+        jobs = config["jobs"]
+        expected = {"AssignScheduledTrips", "AutoCancelNoShowTripGhost", "AutoCancelAfterWaitingTime"}
+        enabled_jobs = {job["name"] for job in jobs if job.get("enabled", True)}
+        self.assertTrue(expected <= enabled_jobs)
+        required = {job["name"] for job in jobs if job.get("require_business_success")}
+        self.assertTrue(expected <= required)
+
     def test_promo_cleanup_requires_business_success_when_enabled(self):
         config = json.loads((Path(main.__file__).parent / "jobs.json").read_text(encoding="utf-8"))
         jobs = config["jobs"]
